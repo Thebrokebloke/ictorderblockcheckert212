@@ -1,10 +1,10 @@
 import gc
 import os
 import time
+import datetime
 import requests
 import pandas as pd
 import yfinance as yf
-from io import StringIO
 import pytz
 from requests.auth import HTTPBasicAuth
 
@@ -32,11 +32,11 @@ ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", 10000.0))
 RISK_PER_TRADE_PCT = 0.01  # 1% risico per trade
 SCAN_INTERVAL_MINUTES = 5
 
-EXTRA_ASSETS = ["SPY", "QQQ", "IWM", "SMH", "GC=F", "SI=F", "HG=F", "ZW=F", "CL=F"]
 FUTURES_MAP = {"GC=F": "GLD", "SI=F": "SLV", "ZW=F": "WEAT"}
+daily_report_sent = False
 
 # ==========================================
-# 2. TELEGRAM ENGINE
+# 2. TELEGRAM ENGINE & REPORTING
 # ==========================================
 def notify_telegram(msg):
     """Verstuurt alle mutaties direct naar je Telegram app."""
@@ -46,9 +46,44 @@ def notify_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code != 200:
+            print(f"❌ Telegram API Fout ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"⚠️ Telegram versturen mislukt: {e}")
+
+def send_daily_portfolio_report():
+    """Haalt actieve posities op en stuurt een dagelijks PnL-overzicht via Telegram."""
+    positions = fetch_active_positions()
+    
+    if not positions:
+        msg = "📊 *DAGELIJKS BOT PORTFOLIO OVERZICHT*\n\nEr staan momenteel geen actieve posities open."
+        notify_telegram(msg)
+        return
+
+    total_pnl = 0.0
+    lines = []
+
+    for ticker, pos in positions.items():
+        ppl = pos.get('ppl', 0.0)  # Pure Profit/Loss in Account Currency
+        quantity = pos.get('quantity', 0.0)
+        current_price = pos.get('currentPrice', 0.0)
+        
+        total_pnl += ppl
+        status_emoji = "🟢" if ppl >= 0 else "🔴"
+        clean_ticker = ticker.replace("_US_EQ", "")
+        lines.append(f"{status_emoji} *{clean_ticker}*: `${ppl:+.2f}` ({quantity} stuks @ ${current_price})")
+
+    overall_emoji = "📈" if total_pnl >= 0 else "📉"
+    report_msg = (
+        f"📊 *DAGELIJKS BOT PORTFOLIO OVERZICHT*\n"
+        f"-----------------------------------\n" +
+        "\n".join(lines) +
+        f"\n-----------------------------------\n"
+        f"{overall_emoji} *Totaal Ongerealiseerd PnL:* `${total_pnl:+.2f}`"
+    )
+    
+    notify_telegram(report_msg)
 
 # ==========================================
 # 3. TRADING 212 EXECUTIE & MONITORING
@@ -65,16 +100,20 @@ def fetch_active_positions():
     return {}
 
 def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
-    """Plaatst de Limit Order via de T212 API en meldt dit in Telegram."""
+    """Plaatst de Limit Order via de T212 API met een verloopdatum van 21 dagen."""
     url = f"{T212_BASE_URL}/equity/orders/limit"
     exec_ticker = FUTURES_MAP.get(ticker, ticker)
     t212_ticker = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
+
+    # Bereken de verloopdatum over exact 21 dagen (ISO 8601 UTC formaat)
+    expiration_date = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=21)).strftime('%Y-%m-%d%H:%M:%SZ')
 
     payload = {
         "ticker": t212_ticker,
         "quantity": float(shares),
         "limitPrice": float(entry_price),
-        "timeInForce": "DAY"
+        "timeInForce": "GOOD_TILL_DATE",
+        "expirationDate": expiration_date
     }
 
     try:
@@ -88,6 +127,7 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
                 f"🎯 *Entry (OB Top):* ${entry_price}\n"
                 f"🛑 *Stop Loss:* ${stop_loss}\n"
                 f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
+                f"⏳ *Geldig tot:* 21 dagen (`{expiration_date[:10]}`)\n"
                 f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
             )
             notify_telegram(msg)
@@ -107,16 +147,11 @@ def is_bullish(df):
     return df['Low'].iloc[-1] > df['Low'].iloc[-3] and df['High'].iloc[-1] > df['High'].iloc[-3]
 
 def get_market_universe():
-    try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        df_sp500 = pd.read_html(StringIO(res.text))[0]
-        tickers = df_sp500['Symbol'].str.replace('.', '-').tolist()
-        data = yf.download(tickers, period="1mo", progress=False)['Volume']
-        top50 = data.mean().sort_values(ascending=False).head(50).index.tolist()
-        return list(dict.fromkeys(top50 + EXTRA_ASSETS))
-    except Exception:
-        return ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL"] + EXTRA_ASSETS
+    """Lichte vastomlijnde lijst om massale geheugen-downloads te voorkomen."""
+    return [
+        "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX", 
+        "SPY", "QQQ", "IWM", "SMH", "GC=F", "SI=F", "HG=F", "ZW=F", "CL=F"
+    ]
 
 def scan_ticker(ticker):
     """Scant 1 ticker met minimale geheugenbelasting."""
@@ -124,19 +159,16 @@ def scan_ticker(ticker):
     try:
         t_obj = yf.Ticker(ticker)
         
-        # Minimale data ophalen (afgelopen 3 maanden)
         df_d = t_obj.history(period="3mo", interval="1d")
         if df_d.empty or len(df_d) < 10: 
             return None
 
-        # DataFrames direct strippen tot de laatste paar rijen
         df_w = df_d.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(10)
         df_m = df_d.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(5)
 
         if not (is_bullish(df_m) and is_bullish(df_w) and is_bullish(df_d)): 
             return None
 
-        # 1H data ophalen en resamplen
         df_1h = t_obj.history(period="30d", interval="1h")
         if df_1h.empty: 
             return None
@@ -169,7 +201,6 @@ def scan_ticker(ticker):
     except Exception:
         return None
     finally:
-        # Verwijder het Ticker-object direct uit het RAM geheugen
         if t_obj:
             del t_obj
 
@@ -177,14 +208,24 @@ def scan_ticker(ticker):
 # 5. MAIN AUTONOME AGENT LUS
 # ==========================================
 def main():
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE (GEOPTIMALISEERD)*\nAgent scant 24/5 op Railway en stuurt mutaties door.")
+    global daily_report_sent
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (21-dagen orderverval geactiveerd).")
     
     executed_setups = set()
     tracked_positions = {}
 
     while True:
         try:
-            # 1. Monitoren van actieve open/gesloten posities op T212
+            # 1. Tijdcheck voor Dagelijks Rapport (vlak na 16:00 NY beurssluiting)
+            now_ny = datetime.datetime.now(NY_TZ)
+            if now_ny.hour == 16 and now_ny.minute >= 5:
+                if not daily_report_sent:
+                    send_daily_portfolio_report()
+                    daily_report_sent = True
+            else:
+                daily_report_sent = False
+
+            # 2. Monitoren van actieve open/gesloten posities op T212
             current_positions = fetch_active_positions()
             
             for prev_ticker in list(tracked_positions.keys()):
@@ -192,13 +233,13 @@ def main():
                     notify_telegram(
                         f"🔴 *POSITIE GESLOTEN (SL / TP HIT)*\n\n"
                         f"📌 *Asset:* `{prev_ticker}`\n"
-                        f"ℹ️ De positie is op Trading 212 gesloten op de Stop Loss of Take Profit."
+                        f"ℹ️ Positie is op Trading 212 gesloten via Stop Loss of Take Profit."
                     )
                     del tracked_positions[prev_ticker]
 
             tracked_positions = current_positions
 
-            # 2. Scannen van de markt op nieuwe OB setups
+            # 3. Scannen van de markt op nieuwe OB setups
             tickers = get_market_universe()
             for ticker in tickers:
                 setup = scan_ticker(ticker)
@@ -219,7 +260,7 @@ def main():
         except Exception as e:
             print(f"Fout in hoofdlus: {e}")
 
-        # Dwing Python om ongebruikt RAM-geheugen direct vrij te geven
+        # Dwing Python om ongebruikt RAM-geheugen vrij te geven
         gc.collect()
 
         print(f"✅ Scan voltooid. RAM opgeruimd. Slapen voor {SCAN_INTERVAL_MINUTES} minuten...")
