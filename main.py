@@ -2,19 +2,20 @@ import gc
 import os
 import time
 import datetime
+import logging
 import requests
 import pandas as pd
 import yfinance as yf
 import pytz
 from requests.auth import HTTPBasicAuth
-import logging
 
-# Onderdruk storende waarschuwingen van yfinance en urllib3 in de Railway logs
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
-logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 # ==========================================
 # 1. OPTIMALISATIE & CONFIGURATIE
 # ==========================================
+# Onderdruk storende waarschuwingen van yfinance en urllib3 in de Railway logs
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+logging.getLogger('urllib3').setLevel(logging.CRITICAL)
+
 # Schakel yfinance tijdelijke schijf-cache uit om geheugengroei te voorkomen
 yf.set_tz_cache_location("/tmp/yf_cache")
 
@@ -159,13 +160,14 @@ def get_market_universe():
 
 def scan_ticker(ticker):
     """Scant 1 ticker met minimale geheugenbelasting."""
-    t_obj = None
     try:
-        t_obj = yf.Ticker(ticker)
-        
-        df_d = t_obj.history(period="3mo", interval="1d")
+        # Directe download zonder Ticker-objecten in het geheugen vast te houden
+        df_d = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
         if df_d.empty or len(df_d) < 10: 
             return None
+
+        if isinstance(df_d.columns, pd.MultiIndex):
+            df_d.columns = df_d.columns.get_level_values(0)
 
         df_w = df_d.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(10)
         df_m = df_d.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(5)
@@ -173,9 +175,12 @@ def scan_ticker(ticker):
         if not (is_bullish(df_m) and is_bullish(df_w) and is_bullish(df_d)): 
             return None
 
-        df_1h = t_obj.history(period="30d", interval="1h")
+        df_1h = yf.download(ticker, period="30d", interval="1h", progress=False, auto_adjust=True)
         if df_1h.empty: 
             return None
+
+        if isinstance(df_1h.columns, pd.MultiIndex):
+            df_1h.columns = df_1h.columns.get_level_values(0)
 
         df_4h = df_1h.resample('4h', offset='9.5h').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
@@ -185,8 +190,8 @@ def scan_ticker(ticker):
         c_ob, c_disp, c_fvg = df_4h.iloc[i-2], df_4h.iloc[i-1], df_4h.iloc[i]
 
         if (c_ob['Close'] < c_ob['Open']) and (c_disp['Close'] > c_ob['High']) and (c_fvg['Low'] > c_ob['High']):
-            ob_top = round(c_ob['High'], 2)
-            ob_bottom = round(c_ob['Low'], 2)
+            ob_top = round(float(c_ob['High']), 2)
+            ob_bottom = round(float(c_ob['Low']), 2)
             
             risk_per_share = ob_top - ob_bottom
             if risk_per_share <= 0: return None
@@ -204,9 +209,6 @@ def scan_ticker(ticker):
         return None
     except Exception:
         return None
-    finally:
-        if t_obj:
-            del t_obj
 
 # ==========================================
 # 5. MAIN AUTONOME AGENT LUS
