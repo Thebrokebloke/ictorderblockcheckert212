@@ -1,0 +1,6 @@
+pandas
+yfinance
+requests
+pytz
+tabulate
+lxml
