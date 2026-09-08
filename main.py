@@ -110,7 +110,6 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
     exec_ticker = FUTURES_MAP.get(ticker, ticker)
     t212_ticker = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
 
-    # Bereken de verloopdatum over exact 21 dagen (ISO 8601 UTC formaat)
     expiration_date = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=21)).strftime('%Y-%m-%d%H:%M:%SZ')
 
     payload = {
@@ -138,12 +137,19 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
             notify_telegram(msg)
             return True
         else:
-            print(f"❌ T212 Order geweigerd: {res.text}")
+            # ⚠️ Trading 212 API weigert de order (bijv. te weinig saldo, verkeerd formaat, markt dicht)
+            error_msg = (
+                f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
+                f"📌 *Asset:* `{exec_ticker}` ({ticker})\n"
+                f"📊 *Status Code:* `{res.status_code}`\n"
+                f"❌ *Reden van T212:* `{res.text}`"
+            )
+            notify_telegram(error_msg)
             return False
     except Exception as e:
-        print(f"❌ Order fout: {e}")
+        # 🚨 Netwerkfout of verbindingsstoring
+        notify_telegram(f"🚨 *CRITISCHE ORDER FOUT (NETWERK/API)*\n\n📌 *Asset:* `{exec_ticker}`\n❌ *Foutmelding:* `{e}`")
         return False
-
 # ==========================================
 # 4. GEHEUGENVRIENDELIJKE ICT SCANNER
 # ==========================================
