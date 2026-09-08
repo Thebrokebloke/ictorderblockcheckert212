@@ -7,7 +7,11 @@ import pandas as pd
 import yfinance as yf
 import pytz
 from requests.auth import HTTPBasicAuth
+import logging
 
+# Onderdruk storende waarschuwingen van yfinance en urllib3 in de Railway logs
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 # ==========================================
 # 1. OPTIMALISATIE & CONFIGURATIE
 # ==========================================
