@@ -105,11 +105,12 @@ def fetch_active_positions():
     return {}
 
 def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
-    """Plaatst de Limit Order via de T212 API met een verloopdatum van 21 dagen."""
+    """Plaatst de Limit Order via de T212 API met een verloopdatum van 21 dagen en Telegram alerts bij fouten."""
     url = f"{T212_BASE_URL}/equity/orders/limit"
     exec_ticker = FUTURES_MAP.get(ticker, ticker)
     t212_ticker = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
 
+    # Bereken de verloopdatum over exact 21 dagen (ISO 8601 UTC formaat)
     expiration_date = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=21)).strftime('%Y-%m-%d%H:%M:%SZ')
 
     payload = {
@@ -137,7 +138,7 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
             notify_telegram(msg)
             return True
         else:
-            # ⚠️ Trading 212 API weigert de order (bijv. te weinig saldo, verkeerd formaat, markt dicht)
+            # ⚠️ Melding naar Telegram als T212 de order weigert
             error_msg = (
                 f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
                 f"📌 *Asset:* `{exec_ticker}` ({ticker})\n"
@@ -147,9 +148,10 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
             notify_telegram(error_msg)
             return False
     except Exception as e:
-        # 🚨 Netwerkfout of verbindingsstoring
+        # 🚨 Melding naar Telegram bij netwerk-/API-storingen
         notify_telegram(f"🚨 *CRITISCHE ORDER FOUT (NETWERK/API)*\n\n📌 *Asset:* `{exec_ticker}`\n❌ *Foutmelding:* `{e}`")
         return False
+
 # ==========================================
 # 4. GEHEUGENVRIENDELIJKE ICT SCANNER
 # ==========================================
@@ -167,7 +169,7 @@ def get_market_universe():
 def scan_ticker(ticker):
     """Scant 1 ticker met minimale geheugenbelasting."""
     try:
-        # Directe download zonder Ticker-objecten in het geheugen vast te houden
+        # Directe download zonder zware Ticker-objecten in te laden
         df_d = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
         if df_d.empty or len(df_d) < 10: 
             return None
@@ -221,7 +223,7 @@ def scan_ticker(ticker):
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (21-dagen orderverval geactiveerd).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (Geheugengebruik ~80MB, 21-dagen orderverval geactiveerd).")
     
     executed_setups = set()
     tracked_positions = {}
