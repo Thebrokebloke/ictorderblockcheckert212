@@ -8,33 +8,28 @@ import pandas as pd
 import yfinance as yf
 import pytz
 from requests.auth import HTTPBasicAuth
+from multiprocessing import Process, Queue
 
 # ==========================================
 # 1. OPTIMALISATIE & CONFIGURATIE
 # ==========================================
-# Onderdruk storende waarschuwingen van yfinance en urllib3 in de Railway logs
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
-
-# Schakel yfinance tijdelijke schijf-cache uit om geheugengroei te voorkomen
 yf.set_tz_cache_location("/tmp/yf_cache")
 
 NY_TZ = pytz.timezone('America/New_York')
 
-# Veilig ophalen van variabelen uit Railway Environment Variables
 T212_API_KEY_ID = os.getenv("T212_API_KEY_ID", "")
 T212_SECRET_KEY = os.getenv("T212_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Trading 212 DEMO Endpoint (Paper Trading)
 T212_BASE_URL = "https://demo.trading212.com/api/v0"
 T212_AUTH = HTTPBasicAuth(T212_API_KEY_ID, T212_SECRET_KEY)
 T212_HEADERS = {"Content-Type": "application/json"}
 
-# Risicobeheer
 ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", 10000.0))
-RISK_PER_TRADE_PCT = 0.01  # 1% risico per trade
+RISK_PER_TRADE_PCT = 0.01
 SCAN_INTERVAL_MINUTES = 5
 
 FUTURES_MAP = {"GC=F": "GLD", "SI=F": "SLV", "ZW=F": "WEAT"}
@@ -44,7 +39,6 @@ daily_report_sent = False
 # 2. TELEGRAM ENGINE & REPORTING
 # ==========================================
 def notify_telegram(msg):
-    """Verstuurt alle mutaties direct naar je Telegram app."""
     if not TELEGRAM_BOT_TOKEN:
         print(f"[LOG]: {msg}")
         return
@@ -58,9 +52,7 @@ def notify_telegram(msg):
         print(f"⚠️ Telegram versturen mislukt: {e}")
 
 def send_daily_portfolio_report():
-    """Haalt actieve posities op en stuurt een dagelijks PnL-overzicht via Telegram."""
     positions = fetch_active_positions()
-    
     if not positions:
         msg = "📊 *DAGELIJKS BOT PORTFOLIO OVERZICHT*\n\nEr staan momenteel geen actieve posities open."
         notify_telegram(msg)
@@ -68,12 +60,10 @@ def send_daily_portfolio_report():
 
     total_pnl = 0.0
     lines = []
-
     for ticker, pos in positions.items():
-        ppl = pos.get('ppl', 0.0)  # Pure Profit/Loss in Account Currency
+        ppl = pos.get('ppl', 0.0)
         quantity = pos.get('quantity', 0.0)
         current_price = pos.get('currentPrice', 0.0)
-        
         total_pnl += ppl
         status_emoji = "🟢" if ppl >= 0 else "🔴"
         clean_ticker = ticker.replace("_US_EQ", "")
@@ -87,14 +77,12 @@ def send_daily_portfolio_report():
         f"\n-----------------------------------\n"
         f"{overall_emoji} *Totaal Ongerealiseerd PnL:* `${total_pnl:+.2f}`"
     )
-    
     notify_telegram(report_msg)
 
 # ==========================================
 # 3. TRADING 212 EXECUTIE & MONITORING
 # ==========================================
 def fetch_active_positions():
-    """Haalt alle momenteel openstaande posities op bij Trading 212."""
     url = f"{T212_BASE_URL}/equity/portfolio"
     try:
         res = requests.get(url, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
@@ -105,12 +93,10 @@ def fetch_active_positions():
     return {}
 
 def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
-    """Plaatst de Limit Order via de T212 API met een verloopdatum van 21 dagen en Telegram alerts bij fouten."""
     url = f"{T212_BASE_URL}/equity/orders/limit"
     exec_ticker = FUTURES_MAP.get(ticker, ticker)
     t212_ticker = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
 
-    # Bereken de verloopdatum over exact 21 dagen (ISO 8601 UTC formaat)
     expiration_date = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=21)).strftime('%Y-%m-%d%H:%M:%SZ')
 
     payload = {
@@ -158,23 +144,13 @@ def is_bullish(df):
     return df['Low'].iloc[-1] > df['Low'].iloc[-3] and df['High'].iloc[-1] > df['High'].iloc[-3]
 
 def get_market_universe():
-    """Lichte vastomlijnde lijst om massale geheugen-downloads te voorkomen."""
     return [
         "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX", 
         "SPY", "QQQ", "IWM", "SMH", "GC=F", "SI=F", "HG=F", "ZW=F", "CL=F"
     ]
 
-def scan_ticker(ticker):
-    """Scant 1 ticker met expliciete opschoning van Pandas DataFrames."""
-    df_d = None
-    df_w = None
-    df_m = None
-    df_1h = None
-    df_4h = None
-    result = None
-
+def scan_single_ticker(ticker):
     try:
-        # Directe download zonder zware Ticker-objecten in te laden
         df_d = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
         if df_d.empty or len(df_d) < 10: 
             return None
@@ -212,27 +188,51 @@ def scan_ticker(ticker):
             take_profit = round(ob_top + (risk_per_share * 3), 2)
             shares = round((ACCOUNT_CAPITAL * RISK_PER_TRADE_PCT) / risk_per_share, 2)
 
-            result = {
+            return {
                 "ticker": ticker,
                 "ob_top": ob_top,
                 "ob_bottom": ob_bottom,
                 "take_profit": take_profit,
                 "shares": shares
             }
+        return None
     except Exception:
-        pass
-    finally:
-        # Expliciete vernietiging van zware variabelen om geheugenlekken te voorkomen
-        del df_d, df_w, df_m, df_1h, df_4h
+        return None
 
-    return result
+def _scanner_process_worker(queue):
+    """Worker-functie die in een geïsoleerd proces draait en na afloop alle RAM vrijgeeft."""
+    setups = []
+    tickers = get_market_universe()
+    for ticker in tickers:
+        setup = scan_single_ticker(ticker)
+        if setup:
+            setups.append(setup)
+        time.sleep(0.3)
+    queue.put(setups)
+
+def run_isolated_scan():
+    """Voert de scan uit in een geïsoleerd subprocess zodat het OS al het geheugen kan leegvegen."""
+    q = Queue()
+    p = Process(target=_scanner_process_worker, args=(q,))
+    p.start()
+    p.join(timeout=180)  # Maximaal 3 minuten de tijd
+    
+    setups = []
+    if not q.empty():
+        setups = q.get()
+    
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        
+    return setups
 
 # ==========================================
 # 5. MAIN AUTONOME AGENT LUS
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (Memory leak-fix toegepast).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (Isolated Subprocess Memory Architecture).")
     
     executed_setups = set()
     tracked_positions = {}
@@ -265,23 +265,20 @@ def main():
 
             tracked_positions = current_positions
 
-            # 3. Scannen van de markt op nieuwe OB setups
-            tickers = get_market_universe()
-            for ticker in tickers:
-                setup = scan_ticker(ticker)
-                if setup:
-                    setup_id = f"{ticker}_{setup['ob_top']}"
-                    if setup_id not in executed_setups:
-                        success = place_t212_order_with_sl_tp(
-                            ticker=setup['ticker'],
-                            shares=setup['shares'],
-                            entry_price=setup['ob_top'],
-                            stop_loss=setup['ob_bottom'],
-                            take_profit=setup['take_profit']
-                        )
-                        if success:
-                            executed_setups.add(setup_id)
-                time.sleep(0.3)
+            # 3. Scannen via geïsoleerd subprocess (RAM wordt na elke scan 100% gewist)
+            found_setups = run_isolated_scan()
+            for setup in found_setups:
+                setup_id = f"{setup['ticker']}_{setup['ob_top']}"
+                if setup_id not in executed_setups:
+                    success = place_t212_order_with_sl_tp(
+                        ticker=setup['ticker'],
+                        shares=setup['shares'],
+                        entry_price=setup['ob_top'],
+                        stop_loss=setup['ob_bottom'],
+                        take_profit=setup['take_profit']
+                    )
+                    if success:
+                        executed_setups.add(setup_id)
 
             # Schoon de executed_setups cache elke 24 uur op
             if loop_count % 288 == 0:
@@ -290,10 +287,8 @@ def main():
         except Exception as e:
             print(f"Fout in hoofdlus: {e}")
 
-        # Dwing diepe geheugen-opruiming af
         gc.collect()
-
-        print(f"✅ Scan voltooid. RAM opgeruimd. Slapen voor {SCAN_INTERVAL_MINUTES} minuten...")
+        print(f"✅ Scan voltooid. Geïsoleerd proces beëindigd. Slapen voor {SCAN_INTERVAL_MINUTES} minuten...")
         time.sleep(SCAN_INTERVAL_MINUTES * 60)
 
 if __name__ == "__main__":
