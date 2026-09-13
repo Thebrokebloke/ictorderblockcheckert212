@@ -18,6 +18,7 @@ logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 yf.set_tz_cache_location("/tmp/yf_cache")
 
 NY_TZ = pytz.timezone('America/New_York')
+NL_TZ = pytz.timezone('Europe/Amsterdam')
 
 T212_API_KEY_ID = os.getenv("T212_API_KEY_ID", "")
 T212_SECRET_KEY = os.getenv("T212_SECRET_KEY", "")
@@ -30,7 +31,7 @@ T212_HEADERS = {"Content-Type": "application/json"}
 
 ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", 10000.0))
 RISK_PER_TRADE_PCT = 0.01
-SCAN_INTERVAL_MINUTES = 5
+SCAN_INTERVAL_MINUTES = 3
 
 FUTURES_MAP = {"GC=F": "GLD", "SI=F": "SLV", "ZW=F": "WEAT"}
 daily_report_sent = False
@@ -80,7 +81,7 @@ def send_daily_portfolio_report():
     notify_telegram(report_msg)
 
 # ==========================================
-# 3. TRADING 212 EXECUTIE & MONITORING
+# 3. TRADING 212 EXECUTIE & METADATA CHECK
 # ==========================================
 def fetch_active_positions():
     url = f"{T212_BASE_URL}/equity/portfolio"
@@ -91,6 +92,36 @@ def fetch_active_positions():
     except Exception as e:
         print(f"Fout bij ophalen portfolio: {e}")
     return {}
+
+def validate_market_universe_with_t212(raw_tickers):
+    """Vraagt de actuele verhandelbare instrumenten op bij T212 en controleert onze scanner-lijst."""
+    url = f"{T212_BASE_URL}/equity/metadata/instruments"
+    try:
+        res = requests.get(url, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
+        if res.status_code == 200:
+            t212_instruments = {item['ticker'] for item in res.json()}
+            valid_tickers = []
+            invalid_tickers = []
+
+            for ticker in raw_tickers:
+                exec_ticker = FUTURES_MAP.get(ticker, ticker)
+                t212_symbol = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
+                
+                if t212_symbol in t212_instruments:
+                    valid_tickers.append(ticker)
+                else:
+                    invalid_tickers.append(ticker)
+
+            if invalid_tickers:
+                notify_telegram(
+                    f"⚠️ *T212 METADATA METING*\n"
+                    f"De volgende tickers zijn NIET gevonden op T212 en worden overgeslagen:\n"
+                    f"`{', '.join(invalid_tickers)}`"
+                )
+            return valid_tickers
+    except Exception as e:
+        notify_telegram(f"⚠️ T212 Metadata check kon niet worden geladen: `{e}`. Standaard universe wordt gebruikt.")
+    return raw_tickers
 
 def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
     url = f"{T212_BASE_URL}/equity/orders/limit"
@@ -112,10 +143,10 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
         if res.status_code in [200, 202]:
             order_data = res.json()
             msg = (
-                f"🟢 *AUTONOMOUS ORDER GEPLAATST (DEMO)*\n\n"
+                f"🟢 *AUTONOMOUS 5M ORDER GEPLAATST*\n\n"
                 f"📌 *Asset:* `{exec_ticker}` ({ticker})\n"
                 f"📦 *Aantal:* {shares} stuks\n"
-                f"🎯 *Entry (OB Top):* ${entry_price}\n"
+                f"🎯 *Entry (5m OB Top):* ${entry_price}\n"
                 f"🛑 *Stop Loss:* ${stop_loss}\n"
                 f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
                 f"⏳ *Geldig tot:* 21 dagen (`{expiration_date[:10]}`)\n"
@@ -137,13 +168,20 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
         return False
 
 # ==========================================
-# 4. GEHEUGENVRIENDELIJKE ICT SCANNER
+# 4. MULTI-TIMEFRAME SCANNER (1W, 1D, 4H, 1H & 5M)
 # ==========================================
 def is_bullish(df):
-    if len(df) < 5: return False
+    if df is None or len(df) < 5: return False
     return df['Low'].iloc[-1] > df['Low'].iloc[-3] and df['High'].iloc[-1] > df['High'].iloc[-3]
 
-def get_market_universe():
+def is_ny_killzone():
+    """Controleert of we in de NY Open Killzone zitten (13:30 - 16:30 NL tijd)."""
+    now_nl = datetime.datetime.now(NL_TZ)
+    start_time = now_nl.replace(hour=13, minute=30, second=0, microsecond=0)
+    end_time = now_nl.replace(hour=16, minute=30, second=0, microsecond=0)
+    return start_time <= now_nl <= end_time
+
+def get_raw_market_universe():
     return [
         "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX", 
         "SPY", "QQQ", "IWM", "SMH", "GC=F", "SI=F", "HG=F", "ZW=F", "CL=F"
@@ -151,34 +189,41 @@ def get_market_universe():
 
 def scan_single_ticker(ticker):
     try:
+        # 1. Macro & Intermediate Alignment (1D, 1W, 4H, 1H)
         df_d = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
-        if df_d.empty or len(df_d) < 10: 
-            return None
-
-        if isinstance(df_d.columns, pd.MultiIndex):
-            df_d.columns = df_d.columns.get_level_values(0)
+        if df_d.empty or len(df_d) < 10: return None
+        if isinstance(df_d.columns, pd.MultiIndex): df_d.columns = df_d.columns.get_level_values(0)
 
         df_w = df_d.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(10)
         df_m = df_d.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(5)
 
-        if not (is_bullish(df_m) and is_bullish(df_w) and is_bullish(df_d)): 
-            return None
+        df_1h_base = yf.download(ticker, period="30d", interval="1h", progress=False, auto_adjust=True)
+        if df_1h_base.empty or len(df_1h_base) < 10: return None
+        if isinstance(df_1h_base.columns, pd.MultiIndex): df_1h_base.columns = df_1h_base.columns.get_level_values(0)
 
-        df_1h = yf.download(ticker, period="30d", interval="1h", progress=False, auto_adjust=True)
-        if df_1h.empty: 
-            return None
-
-        if isinstance(df_1h.columns, pd.MultiIndex):
-            df_1h.columns = df_1h.columns.get_level_values(0)
-
-        df_4h = df_1h.resample('4h', offset='9.5h').agg({
+        df_4h = df_1h_base.resample('4h', offset='9.5h').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
         }).dropna().tail(15)
 
-        i = len(df_4h) - 1
-        c_ob, c_disp, c_fvg = df_4h.iloc[i-2], df_4h.iloc[i-1], df_4h.iloc[i]
+        df_1h = df_1h_base.tail(15)
 
-        if (c_ob['Close'] < c_ob['Open']) and (c_disp['Close'] > c_ob['High']) and (c_fvg['Low'] > c_ob['High']):
+        # 1W, 1D, 4H en 1H moeten ALLEMAAL bullish zijn!
+        if not (is_bullish(df_m) and is_bullish(df_w) and is_bullish(df_d) and is_bullish(df_4h) and is_bullish(df_1h)): 
+            return None
+
+        # 2. Precision 5M Execution & FVG Confluence
+        df_5m = yf.download(ticker, period="3d", interval="5m", progress=False, auto_adjust=True)
+        if df_5m.empty or len(df_5m) < 10: return None
+        if isinstance(df_5m.columns, pd.MultiIndex): df_5m.columns = df_5m.columns.get_level_values(0)
+
+        i = len(df_5m) - 1
+        c_ob, c_disp, c_fvg = df_5m.iloc[i-2], df_5m.iloc[i-1], df_5m.iloc[i]
+
+        # Check op Bullish 5m OB + FVG Confluence
+        has_ob = (c_ob['Close'] < c_ob['Open']) and (c_disp['Close'] > c_ob['High'])
+        has_fvg = (c_fvg['Low'] > c_ob['High'])
+
+        if has_ob and has_fvg:
             ob_top = round(float(c_ob['High']), 2)
             ob_bottom = round(float(c_ob['Low']), 2)
             
@@ -199,23 +244,20 @@ def scan_single_ticker(ticker):
     except Exception:
         return None
 
-def _scanner_process_worker(queue):
-    """Worker-functie die in een geïsoleerd proces draait en na afloop alle RAM vrijgeeft."""
+def _scanner_process_worker(queue, active_universe):
     setups = []
-    tickers = get_market_universe()
-    for ticker in tickers:
+    for ticker in active_universe:
         setup = scan_single_ticker(ticker)
         if setup:
             setups.append(setup)
         time.sleep(0.3)
     queue.put(setups)
 
-def run_isolated_scan():
-    """Voert de scan uit in een geïsoleerd subprocess zodat het OS al het geheugen kan leegvegen."""
+def run_isolated_scan(active_universe):
     q = Queue()
-    p = Process(target=_scanner_process_worker, args=(q,))
+    p = Process(target=_scanner_process_worker, args=(q, active_universe))
     p.start()
-    p.join(timeout=180)  # Maximaal 3 minuten de tijd
+    p.join(timeout=180)
     
     setups = []
     if not q.empty():
@@ -232,8 +274,13 @@ def run_isolated_scan():
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (Isolated Subprocess Memory Architecture).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1W/1D/4H/1H Alignment + 5m OB/FVG Precision (NY Killzone Filter).")
     
+    # Valideer de tickers met Trading 212 metadata bij het opstarten
+    raw_universe = get_raw_market_universe()
+    active_universe = validate_market_universe_with_t212(raw_universe)
+    notify_telegram(f"✅ *T212 UNIVERSE GEVALIDEERD:* `{len(active_universe)}/{len(raw_universe)}` Tickers Actief voor Scans.")
+
     executed_setups = set()
     tracked_positions = {}
     loop_count = 0
@@ -242,7 +289,7 @@ def main():
         try:
             loop_count += 1
 
-            # 1. Tijdcheck voor Dagelijks Rapport (vlak na 16:00 NY beurssluiting)
+            # 1. Tijdcheck voor Dagelijks Rapport
             now_ny = datetime.datetime.now(NY_TZ)
             if now_ny.hour == 16 and now_ny.minute >= 5:
                 if not daily_report_sent:
@@ -251,44 +298,43 @@ def main():
             else:
                 daily_report_sent = False
 
-            # 2. Monitoren van actieve open/gesloten posities op T212
+            # 2. Monitoren van posities
             current_positions = fetch_active_positions()
-            
             for prev_ticker in list(tracked_positions.keys()):
                 if prev_ticker not in current_positions:
                     notify_telegram(
                         f"🔴 *POSITIE GESLOTEN (SL / TP HIT)*\n\n"
                         f"📌 *Asset:* `{prev_ticker}`\n"
-                        f"ℹ️ Positie is op Trading 212 gesloten via Stop Loss of Take Profit."
+                        f"ℹ️ Positie is op Trading 212 gesloten."
                     )
                     del tracked_positions[prev_ticker]
-
             tracked_positions = current_positions
 
-            # 3. Scannen via geïsoleerd subprocess (RAM wordt na elke scan 100% gewist)
-            found_setups = run_isolated_scan()
-            for setup in found_setups:
-                setup_id = f"{setup['ticker']}_{setup['ob_top']}"
-                if setup_id not in executed_setups:
-                    success = place_t212_order_with_sl_tp(
-                        ticker=setup['ticker'],
-                        shares=setup['shares'],
-                        entry_price=setup['ob_top'],
-                        stop_loss=setup['ob_bottom'],
-                        take_profit=setup['take_profit']
-                    )
-                    if success:
-                        executed_setups.add(setup_id)
+            # 3. Alleen scannen tijdens de NY Open Kill Zone (13:30 - 16:30 NL tijd)
+            if is_ny_killzone():
+                found_setups = run_isolated_scan(active_universe)
+                for setup in found_setups:
+                    setup_id = f"{setup['ticker']}_{setup['ob_top']}"
+                    if setup_id not in executed_setups:
+                        success = place_t212_order_with_sl_tp(
+                            ticker=setup['ticker'],
+                            shares=setup['shares'],
+                            entry_price=setup['ob_top'],
+                            stop_loss=setup['ob_bottom'],
+                            take_profit=setup['take_profit']
+                        )
+                        if success:
+                            executed_setups.add(setup_id)
+            else:
+                print("⏳ Buiten NY Killzone venster (13:30-16:30 NL). Geen nieuwe 5m scans uitgevoerd.")
 
-            # Schoon de executed_setups cache elke 24 uur op
-            if loop_count % 288 == 0:
+            if loop_count % 480 == 0:
                 executed_setups.clear()
 
         except Exception as e:
             print(f"Fout in hoofdlus: {e}")
 
         gc.collect()
-        print(f"✅ Scan voltooid. Geïsoleerd proces beëindigd. Slapen voor {SCAN_INTERVAL_MINUTES} minuten...")
         time.sleep(SCAN_INTERVAL_MINUTES * 60)
 
 if __name__ == "__main__":
