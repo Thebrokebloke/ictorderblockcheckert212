@@ -138,7 +138,6 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
             notify_telegram(msg)
             return True
         else:
-            # ⚠️ Melding naar Telegram als T212 de order weigert
             error_msg = (
                 f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
                 f"📌 *Asset:* `{exec_ticker}` ({ticker})\n"
@@ -148,7 +147,6 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
             notify_telegram(error_msg)
             return False
     except Exception as e:
-        # 🚨 Melding naar Telegram bij netwerk-/API-storingen
         notify_telegram(f"🚨 *CRITISCHE ORDER FOUT (NETWERK/API)*\n\n📌 *Asset:* `{exec_ticker}`\n❌ *Foutmelding:* `{e}`")
         return False
 
@@ -167,7 +165,14 @@ def get_market_universe():
     ]
 
 def scan_ticker(ticker):
-    """Scant 1 ticker met minimale geheugenbelasting."""
+    """Scant 1 ticker met expliciete opschoning van Pandas DataFrames."""
+    df_d = None
+    df_w = None
+    df_m = None
+    df_1h = None
+    df_4h = None
+    result = None
+
     try:
         # Directe download zonder zware Ticker-objecten in te laden
         df_d = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
@@ -207,29 +212,36 @@ def scan_ticker(ticker):
             take_profit = round(ob_top + (risk_per_share * 3), 2)
             shares = round((ACCOUNT_CAPITAL * RISK_PER_TRADE_PCT) / risk_per_share, 2)
 
-            return {
+            result = {
                 "ticker": ticker,
                 "ob_top": ob_top,
                 "ob_bottom": ob_bottom,
                 "take_profit": take_profit,
                 "shares": shares
             }
-        return None
     except Exception:
-        return None
+        pass
+    finally:
+        # Expliciete vernietiging van zware variabelen om geheugenlekken te voorkomen
+        del df_d, df_w, df_m, df_1h, df_4h
+
+    return result
 
 # ==========================================
 # 5. MAIN AUTONOME AGENT LUS
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (Geheugengebruik ~80MB, 21-dagen orderverval geactiveerd).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nAgent scant 24/5 op Railway (Memory leak-fix toegepast).")
     
     executed_setups = set()
     tracked_positions = {}
+    loop_count = 0
 
     while True:
         try:
+            loop_count += 1
+
             # 1. Tijdcheck voor Dagelijks Rapport (vlak na 16:00 NY beurssluiting)
             now_ny = datetime.datetime.now(NY_TZ)
             if now_ny.hour == 16 and now_ny.minute >= 5:
@@ -271,10 +283,14 @@ def main():
                             executed_setups.add(setup_id)
                 time.sleep(0.3)
 
+            # Schoon de executed_setups cache elke 24 uur op
+            if loop_count % 288 == 0:
+                executed_setups.clear()
+
         except Exception as e:
             print(f"Fout in hoofdlus: {e}")
 
-        # Dwing Python om ongebruikt RAM-geheugen vrij te geven
+        # Dwing diepe geheugen-opruiming af
         gc.collect()
 
         print(f"✅ Scan voltooid. RAM opgeruimd. Slapen voor {SCAN_INTERVAL_MINUTES} minuten...")
