@@ -94,7 +94,6 @@ def fetch_active_positions():
     return {}
 
 def validate_market_universe_with_t212(raw_tickers):
-    """Vraagt de actuele verhandelbare instrumenten op bij T212 en controleert onze scanner-lijst."""
     url = f"{T212_BASE_URL}/equity/metadata/instruments"
     try:
         res = requests.get(url, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
@@ -114,7 +113,7 @@ def validate_market_universe_with_t212(raw_tickers):
 
             if invalid_tickers:
                 notify_telegram(
-                    f"⚠️ *T212 METADATA METING*\n"
+                    f"⚠️ *T212 METADATA CHECK*\n"
                     f"De volgende tickers zijn NIET gevonden op T212 en worden overgeslagen:\n"
                     f"`{', '.join(invalid_tickers)}`"
                 )
@@ -168,17 +167,17 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
         return False
 
 # ==========================================
-# 4. MULTI-TIMEFRAME SCANNER (1W, 1D, 4H, 1H & 5M)
+# 4. TARGETED MULTI-TIMEFRAME SCANNER (1H + 15M + 5M)
 # ==========================================
 def is_bullish(df):
     if df is None or len(df) < 5: return False
     return df['Low'].iloc[-1] > df['Low'].iloc[-3] and df['High'].iloc[-1] > df['High'].iloc[-3]
 
-def is_ny_killzone():
-    """Controleert of we in de NY Open Killzone zitten (13:30 - 16:30 NL tijd)."""
+def is_ny_session():
+    """Controleert of we in de NY beurssessie zitten (13:30 - 21:00 NL tijd)."""
     now_nl = datetime.datetime.now(NL_TZ)
     start_time = now_nl.replace(hour=13, minute=30, second=0, microsecond=0)
-    end_time = now_nl.replace(hour=16, minute=30, second=0, microsecond=0)
+    end_time = now_nl.replace(hour=21, minute=0, second=0, microsecond=0)
     return start_time <= now_nl <= end_time
 
 def get_raw_market_universe():
@@ -189,59 +188,56 @@ def get_raw_market_universe():
 
 def scan_single_ticker(ticker):
     try:
-        # 1. Macro & Intermediate Alignment (1D, 1W, 4H, 1H)
-        df_d = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=True)
-        if df_d.empty or len(df_d) < 10: return None
-        if isinstance(df_d.columns, pd.MultiIndex): df_d.columns = df_d.columns.get_level_values(0)
+        # 1. Check 1H Trend
+        df_1h = yf.download(ticker, period="7d", interval="1h", progress=False, auto_adjust=True)
+        if df_1h.empty or len(df_1h) < 5: return None
+        if isinstance(df_1h.columns, pd.MultiIndex): df_1h.columns = df_1h.columns.get_level_values(0)
 
-        df_w = df_d.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(10)
-        df_m = df_d.resample('ME').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().tail(5)
-
-        df_1h_base = yf.download(ticker, period="30d", interval="1h", progress=False, auto_adjust=True)
-        if df_1h_base.empty or len(df_1h_base) < 10: return None
-        if isinstance(df_1h_base.columns, pd.MultiIndex): df_1h_base.columns = df_1h_base.columns.get_level_values(0)
-
-        df_4h = df_1h_base.resample('4h', offset='9.5h').agg({
-            'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'
-        }).dropna().tail(15)
-
-        df_1h = df_1h_base.tail(15)
-
-        # 1W, 1D, 4H en 1H moeten ALLEMAAL bullish zijn!
-        if not (is_bullish(df_m) and is_bullish(df_w) and is_bullish(df_d) and is_bullish(df_4h) and is_bullish(df_1h)): 
+        if not is_bullish(df_1h):
             return None
 
-        # 2. Precision 5M Execution & FVG Confluence
-        df_5m = yf.download(ticker, period="3d", interval="5m", progress=False, auto_adjust=True)
+        # 2. Check 15m Trend
+        df_15m = yf.download(ticker, period="3d", interval="15m", progress=False, auto_adjust=True)
+        if df_15m.empty or len(df_15m) < 5: return None
+        if isinstance(df_15m.columns, pd.MultiIndex): df_15m.columns = df_15m.columns.get_level_values(0)
+
+        if not is_bullish(df_15m):
+            return None
+
+        # 3. Precision 5m Execution & FVG Confluence
+        df_5m = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True)
         if df_5m.empty or len(df_5m) < 10: return None
         if isinstance(df_5m.columns, pd.MultiIndex): df_5m.columns = df_5m.columns.get_level_values(0)
 
-        i = len(df_5m) - 1
-        c_ob, c_disp, c_fvg = df_5m.iloc[i-2], df_5m.iloc[i-1], df_5m.iloc[i]
+        # We doorzoeken de laatste paar candles op een Orderblock + FVG combinatie
+        for idx in range(len(df_5m) - 1, len(df_5m) - 4, -1):
+            c_ob = df_5m.iloc[idx - 2]
+            c_disp = df_5m.iloc[idx - 1]
+            c_fvg = df_5m.iloc[idx]
 
-        # Check op Bullish 5m OB + FVG Confluence
-        has_ob = (c_ob['Close'] < c_ob['Open']) and (c_disp['Close'] > c_ob['High'])
-        has_fvg = (c_fvg['Low'] > c_ob['High'])
+            has_ob = (c_ob['Close'] < c_ob['Open']) and (c_disp['Close'] > c_ob['High'])
+            has_fvg = (c_fvg['Low'] > c_ob['High'])  # Fair Value Gap boven de OB
 
-        if has_ob and has_fvg:
-            ob_top = round(float(c_ob['High']), 2)
-            ob_bottom = round(float(c_ob['Low']), 2)
-            
-            risk_per_share = ob_top - ob_bottom
-            if risk_per_share <= 0: return None
+            if has_ob and has_fvg:
+                ob_top = round(float(c_ob['High']), 2)
+                ob_bottom = round(float(c_ob['Low']), 2)
+                
+                risk_per_share = ob_top - ob_bottom
+                if risk_per_share <= 0: continue
 
-            take_profit = round(ob_top + (risk_per_share * 3), 2)
-            shares = round((ACCOUNT_CAPITAL * RISK_PER_TRADE_PCT) / risk_per_share, 2)
+                take_profit = round(ob_top + (risk_per_share * 3), 2)
+                shares = round((ACCOUNT_CAPITAL * RISK_PER_TRADE_PCT) / risk_per_share, 2)
 
-            return {
-                "ticker": ticker,
-                "ob_top": ob_top,
-                "ob_bottom": ob_bottom,
-                "take_profit": take_profit,
-                "shares": shares
-            }
+                if shares > 0:
+                    return {
+                        "ticker": ticker,
+                        "ob_top": ob_top,
+                        "ob_bottom": ob_bottom,
+                        "take_profit": take_profit,
+                        "shares": shares
+                    }
         return None
-    except Exception:
+    except Exception as e:
         return None
 
 def _scanner_process_worker(queue, active_universe):
@@ -250,7 +246,7 @@ def _scanner_process_worker(queue, active_universe):
         setup = scan_single_ticker(ticker)
         if setup:
             setups.append(setup)
-        time.sleep(0.3)
+        time.sleep(0.2)
     queue.put(setups)
 
 def run_isolated_scan(active_universe):
@@ -274,12 +270,11 @@ def run_isolated_scan(active_universe):
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1W/1D/4H/1H Alignment + 5m OB/FVG Precision (NY Killzone Filter).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1H + 15m Alignment -> 5m OB/FVG Precision (NY Sessie).")
     
-    # Valideer de tickers met Trading 212 metadata bij het opstarten
     raw_universe = get_raw_market_universe()
     active_universe = validate_market_universe_with_t212(raw_universe)
-    notify_telegram(f"✅ *T212 UNIVERSE GEVALIDEERD:* `{len(active_universe)}/{len(raw_universe)}` Tickers Actief voor Scans.")
+    notify_telegram(f"✅ *T212 UNIVERSE GEVALIDEERD:* `{len(active_universe)}/{len(raw_universe)}` Tickers Actief.")
 
     executed_setups = set()
     tracked_positions = {}
@@ -310,9 +305,11 @@ def main():
                     del tracked_positions[prev_ticker]
             tracked_positions = current_positions
 
-            # 3. Alleen scannen tijdens de NY Open Kill Zone (13:30 - 16:30 NL tijd)
-            if is_ny_killzone():
+            # 3. Scannen tijdens de NY Sessie (13:30 - 21:00 NL tijd)
+            if is_ny_session():
                 found_setups = run_isolated_scan(active_universe)
+                print(f"Scan ronde {loop_count}: {len(found_setups)} geldige setup(s) gevonden.")
+                
                 for setup in found_setups:
                     setup_id = f"{setup['ticker']}_{setup['ob_top']}"
                     if setup_id not in executed_setups:
@@ -326,7 +323,7 @@ def main():
                         if success:
                             executed_setups.add(setup_id)
             else:
-                print("⏳ Buiten NY Killzone venster (13:30-16:30 NL). Geen nieuwe 5m scans uitgevoerd.")
+                print("⏳ Buiten NY Sessie venster (13:30-21:00 NL). Geen nieuwe scans uitgevoerd.")
 
             if loop_count % 480 == 0:
                 executed_setups.clear()
