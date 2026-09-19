@@ -182,8 +182,15 @@ def is_ny_session():
 
 def get_raw_market_universe():
     return [
-        "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX", 
-        "SPY", "QQQ", "IWM", "SMH", "GC=F", "SI=F", "HG=F", "ZW=F", "CL=F"
+        # Major Tech & Growth
+        "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX",
+        "PLTR", "COIN", "TSM", "SMCI", "ARM", "PANW", "CRWD", "UBER", "ABNB",
+        # Finance & Industrials
+        "JPM", "BAC", "GS", "MS", "V", "MA", "CAT", "DIS",
+        # Indices & Sector ETFs
+        "SPY", "QQQ", "IWM", "SMH",
+        # Commodities (Futures -> T212 Mapped)
+        "GC=F", "SI=F", "HG=F", "ZW=F", "CL=F"
     ]
 
 def scan_single_ticker(ticker):
@@ -209,14 +216,13 @@ def scan_single_ticker(ticker):
         if df_5m.empty or len(df_5m) < 10: return None
         if isinstance(df_5m.columns, pd.MultiIndex): df_5m.columns = df_5m.columns.get_level_values(0)
 
-        # We doorzoeken de laatste paar candles op een Orderblock + FVG combinatie
         for idx in range(len(df_5m) - 1, len(df_5m) - 4, -1):
             c_ob = df_5m.iloc[idx - 2]
             c_disp = df_5m.iloc[idx - 1]
             c_fvg = df_5m.iloc[idx]
 
             has_ob = (c_ob['Close'] < c_ob['Open']) and (c_disp['Close'] > c_ob['High'])
-            has_fvg = (c_fvg['Low'] > c_ob['High'])  # Fair Value Gap boven de OB
+            has_fvg = (c_fvg['Low'] > c_ob['High'])
 
             if has_ob and has_fvg:
                 ob_top = round(float(c_ob['High']), 2)
@@ -237,7 +243,7 @@ def scan_single_ticker(ticker):
                         "shares": shares
                     }
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 def _scanner_process_worker(queue, active_universe):
@@ -246,7 +252,7 @@ def _scanner_process_worker(queue, active_universe):
         setup = scan_single_ticker(ticker)
         if setup:
             setups.append(setup)
-        time.sleep(0.2)
+        time.sleep(0.15)
     queue.put(setups)
 
 def run_isolated_scan(active_universe):
@@ -270,7 +276,7 @@ def run_isolated_scan(active_universe):
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1H + 15m Alignment -> 5m OB/FVG Precision (NY Sessie).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1H + 15m Alignment -> 5m OB/FVG Precision (35+ Tickers).")
     
     raw_universe = get_raw_market_universe()
     active_universe = validate_market_universe_with_t212(raw_universe)
@@ -284,7 +290,6 @@ def main():
         try:
             loop_count += 1
 
-            # 1. Tijdcheck voor Dagelijks Rapport
             now_ny = datetime.datetime.now(NY_TZ)
             if now_ny.hour == 16 and now_ny.minute >= 5:
                 if not daily_report_sent:
@@ -293,7 +298,6 @@ def main():
             else:
                 daily_report_sent = False
 
-            # 2. Monitoren van posities
             current_positions = fetch_active_positions()
             for prev_ticker in list(tracked_positions.keys()):
                 if prev_ticker not in current_positions:
@@ -305,10 +309,9 @@ def main():
                     del tracked_positions[prev_ticker]
             tracked_positions = current_positions
 
-            # 3. Scannen tijdens de NY Sessie (13:30 - 21:00 NL tijd)
             if is_ny_session():
                 found_setups = run_isolated_scan(active_universe)
-                print(f"Scan ronde {loop_count}: {len(found_setups)} geldige setup(s) gevonden.")
+                print(f"Scan ronde {loop_count}: {len(found_setups)} geldige setup(s) gevonden uit {len(active_universe)} tickers.")
                 
                 for setup in found_setups:
                     setup_id = f"{setup['ticker']}_{setup['ob_top']}"
