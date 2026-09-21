@@ -9,6 +9,8 @@ import yfinance as yf
 import pytz
 from requests.auth import HTTPBasicAuth
 from multiprocessing import Process, Queue
+# Pas aan naar live.trading212.com als je een echt account gebruikt:
+T212_BASE_URL = os.getenv("T212_BASE_URL", "https://demo.trading212.com/api/v0")
 
 # ==========================================
 # 1. OPTIMALISATIE & CONFIGURATIE
