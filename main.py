@@ -37,10 +37,9 @@ T212_HEADERS = {
 }
 T212_AUTH = HTTPBasicAuth(T212_API_KEY_ID, T212_SECRET_KEY) if T212_SECRET_KEY else None
 
-# Ingesteld op $5000 kapitaal
 ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", 5000.0))
 RISK_PER_TRADE_PCT = 0.01  # 1% risico = $50 per trade
-MAX_POSITION_VALUE = ACCOUNT_CAPITAL * 0.20  # Max $1000 totale orderwaarde per positie (20%)
+MAX_POSITION_VALUE = ACCOUNT_CAPITAL * 0.20  # Max $1000 orderwaarde per positie
 SCAN_INTERVAL_MINUTES = 3
 
 # Mapping tabel voor yfinance ticker naar Trading 212 symbool
@@ -163,14 +162,12 @@ def format_quantity_and_price(t212_ticker, raw_shares, raw_price):
     min_qty = spec.get('minTradeQuantity', 1.0)
     price_precision = spec.get('minTradePricePrecision', 2)
 
-    # 1. BEVEILIGING: Cap de totale positiewaarde tot max 20% van je kapitaal ($1000 max per order)
     total_order_val = float(raw_shares) * float(raw_price)
     if total_order_val > MAX_POSITION_VALUE:
         capped_shares = MAX_POSITION_VALUE / float(raw_price)
-        print(f"⚠️ Orderwaarde (${total_order_val:.2f}) overschrijdt limiet voor $5000 account. Aantal teruggeschaald van {raw_shares} naar {capped_shares:.2f}")
+        print(f"⚠️ Orderwaarde (${total_order_val:.2f}) overschrijdt limiet. Teruggeschaald van {raw_shares} naar {capped_shares:.2f}")
         raw_shares = capped_shares
 
-    # 2. Formatteer hoeveelheid volgens instrument-precisie
     qty = max(float(min_qty), float(raw_shares))
     if qty_precision == 0:
         formatted_qty = int(round(qty))
@@ -193,7 +190,6 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
         "timeInForce": "DAY"
     }
 
-    # Probeer order te plaatsen met automatische retry bij 429 Rate Limits
     for attempt in range(3):
         try:
             res = requests.post(
@@ -267,15 +263,8 @@ def get_raw_market_universe():
         # Finance & Industrials (US Stocks)
         "JPM", "BAC", "GS", "MS", "V", "MA", "CAT", "DIS",
         
-        # European UCITS ETFs op Trading 212 (Werkend op T212 Invest API)
-        "VUSA",  # Vanguard S&P 500 UCITS ETF
-        "EQAC",  # Invesco EQQQ Nasdaq-100 UCITS ETF
-        "IUSN",  # iShares MSCI World Small Cap UCITS ETF
-        "SMH",   # VanEck Semiconductor UCITS ETF
-        
-        # Physical Commodity ETFs op T212
-        "SGLN",  # iShares Physical Gold ETC
-        "SSLV"   # iShares Physical Silver ETC
+        # European UCITS ETFs op Trading 212
+        "VUSA", "EQAC", "IUSN", "SMH", "SGLN", "SSLV"
     ]
 
 def clean_dataframe(df):
@@ -287,25 +276,24 @@ def clean_dataframe(df):
 
 def scan_single_ticker(ticker):
     try:
-        # 1. Check 1H Trend
-        df_1h = yf.download(ticker, period="7d", interval="1h", progress=False, auto_adjust=False)
+        # Gebruik auto_adjust=True om split-gecorrigeerde prijzen te garanderen
+        df_1h = yf.download(ticker, period="7d", interval="1h", progress=False, auto_adjust=True)
         df_1h = clean_dataframe(df_1h)
         if df_1h is None or not is_bullish(df_1h): 
             return None
 
-        # 2. Check 15m Trend
-        df_15m = yf.download(ticker, period="3d", interval="15m", progress=False, auto_adjust=False)
+        df_15m = yf.download(ticker, period="3d", interval="15m", progress=False, auto_adjust=True)
         df_15m = clean_dataframe(df_15m)
         if df_15m is None or not is_bullish(df_15m): 
             return None
 
-        # 3. Precision 5m Execution & FVG Confluence
-        df_5m = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=False)
+        df_5m = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True)
         df_5m = clean_dataframe(df_5m)
         if df_5m is None or len(df_5m) < 10: 
             return None
 
-        latest_close = float(df_5m['Close'].iloc[-1])
+        # Haal de meest actuele realtime sluitingsprijs op van de laatste candle
+        current_realtime_price = float(df_5m['Close'].iloc[-1])
 
         for idx in range(len(df_5m) - 1, len(df_5m) - 4, -1):
             c_ob = df_5m.iloc[idx - 2]
@@ -319,8 +307,9 @@ def scan_single_ticker(ticker):
                 ob_top = round(float(c_ob['High']), 2)
                 ob_bottom = round(float(c_ob['Low']), 2)
 
-                # SANITY CHECK: Negeer uitschieters als de entry > 2.5% afwijkt van de actuele koers
-                if abs(ob_top - latest_close) / latest_close > 0.025:
+                # STRIKTE REALTIME SANITY CHECK: Negeer orders die > 2% afwijken van de actuele marktkoers
+                if abs(ob_top - current_realtime_price) / current_realtime_price > 0.02:
+                    print(f"⚠️ {ticker} overgeslagen: berekende entry ${ob_top} wekt >2\% af van actuele prijs${current_realtime_price:.2f}")
                     continue
 
                 risk_per_share = ob_top - ob_bottom
