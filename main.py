@@ -153,20 +153,16 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
     url = f"{T212_BASE_URL}/equity/orders/limit"
     t212_ticker = resolve_t212_ticker(ticker)
 
-    # Zorg dat de hoeveelheid minimaal 1 is
-    quantity = float(round(max(1.0, float(shares)), 2))
+    # Zorg dat de hoeveelheid een integer is voor US EQ aandelen
+    quantity = int(max(1, round(float(shares))))
     limit_price = float(round(entry_price, 2))
 
-    # T212 v0 OpenAPI vereiste: ISO UTC string met milliseconds & Z
-    exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
-    expiration_str = exp_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-
+    # Officiele T212 Public API Limit Order Schema
     payload = {
         "ticker": t212_ticker,
         "quantity": quantity,
         "limitPrice": limit_price,
-        "timeInForce": "TIME_INVALIDATED",
-        "expirationDate": expiration_str
+        "timeInForce": "DAY"
     }
 
     try:
@@ -186,7 +182,7 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
                 f"🎯 *Entry (5m OB Top):* ${limit_price}\n"
                 f"🛑 *Stop Loss:* ${stop_loss}\n"
                 f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
-                f"⏳ *Geldig tot:* `{expiration_str[:10]}`\n"
+                f"⏳ *Geldigheid:* `DAY`\n"
                 f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
             )
             notify_telegram(msg)
