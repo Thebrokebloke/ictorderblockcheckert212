@@ -9,8 +9,6 @@ import yfinance as yf
 import pytz
 from requests.auth import HTTPBasicAuth
 from multiprocessing import Process, Queue
-# Pas aan naar live.trading212.com als je een echt account gebruikt:
-#T212_BASE_URL = os.getenv("T212_BASE_URL", "https://demo.trading212.com/api/v0")
 
 # ==========================================
 # 1. OPTIMALISATIE & CONFIGURATIE
@@ -22,14 +20,21 @@ yf.set_tz_cache_location("/tmp/yf_cache")
 NY_TZ = pytz.timezone('America/New_York')
 NL_TZ = pytz.timezone('Europe/Amsterdam')
 
-T212_API_KEY_ID = os.getenv("T212_API_KEY_ID", "")
+# Flexibele uitlezing van omgevingsvariabelen
+T212_API_KEY_ID = os.getenv("T212_API_KEY_ID") or os.getenv("T212_API_KEY", "")
 T212_SECRET_KEY = os.getenv("T212_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-T212_BASE_URL = "https://demo.trading212.com/api/v0"
-T212_AUTH = HTTPBasicAuth(T212_API_KEY_ID, T212_SECRET_KEY)
-T212_HEADERS = {"Content-Type": "application/json"}
+# T212 Base URL (Standaard ingesteld op DEMO)
+T212_BASE_URL = os.getenv("T212_BASE_URL", "https://demo.trading212.com/api/v0")
+
+# Dual-Auth Setup (Werkt voor zowel Authorization Header als Basic HTTP Auth)
+T212_HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": T212_API_KEY_ID
+}
+T212_AUTH = HTTPBasicAuth(T212_API_KEY_ID, T212_SECRET_KEY) if T212_SECRET_KEY else None
 
 ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", 10000.0))
 RISK_PER_TRADE_PCT = 0.01
@@ -129,28 +134,36 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
     exec_ticker = FUTURES_MAP.get(ticker, ticker)
     t212_ticker = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
 
-    expiration_date = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=21)).strftime('%Y-%m-%d%H:%M:%SZ')
+    # Zorg dat quantity minimaal 1.0 is of een afgeronde float
+    quantity = float(round(max(1.0, float(shares)), 2))
+    limit_price = float(round(entry_price, 2))
 
+    # T212 API v0 geaccepteerde payload voor Limit Orders
     payload = {
         "ticker": t212_ticker,
-        "quantity": float(shares),
-        "limitPrice": float(entry_price),
-        "timeInForce": "GOOD_TILL_DATE",
-        "expirationDate": expiration_date
+        "quantity": quantity,
+        "limitPrice": limit_price,
+        "timeInForce": "GOOD_TILL_CANCEL"
     }
 
     try:
-        res = requests.post(url, json=payload, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
+        res = requests.post(
+            url, 
+            json=payload, 
+            headers=T212_HEADERS, 
+            auth=T212_AUTH, 
+            timeout=10
+        )
         if res.status_code in [200, 202]:
             order_data = res.json()
             msg = (
                 f"🟢 *AUTONOMOUS 5M ORDER GEPLAATST*\n\n"
                 f"📌 *Asset:* `{exec_ticker}` ({ticker})\n"
-                f"📦 *Aantal:* {shares} stuks\n"
-                f"🎯 *Entry (5m OB Top):* ${entry_price}\n"
+                f"📦 *Aantal:* {quantity} stuks\n"
+                f"🎯 *Entry (5m OB Top):* ${limit_price}\n"
                 f"🛑 *Stop Loss:* ${stop_loss}\n"
                 f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
-                f"⏳ *Geldig tot:* 21 dagen (`{expiration_date[:10]}`)\n"
+                f"⏳ *Geldigheid:* `GOOD_TILL_CANCEL`\n"
                 f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
             )
             notify_telegram(msg)
