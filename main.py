@@ -3,6 +3,7 @@ import os
 import time
 import datetime
 import logging
+import json
 import requests
 import pandas as pd
 import yfinance as yf
@@ -127,7 +128,6 @@ def validate_market_universe_with_t212(raw_tickers):
     try:
         res = requests.get(url, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
         if res.status_code == 200:
-            # Sla de volledige specificaties per instrument op
             instruments_data = res.json()
             active_t212_instruments = {item['ticker']: item for item in instruments_data}
             
@@ -153,47 +153,64 @@ def validate_market_universe_with_t212(raw_tickers):
     return raw_tickers
 
 def format_quantity_and_price(t212_ticker, raw_shares, raw_price):
-    """Formatteert quantity en limitPrice exact naar de specificaties van T212 voor het aandeel."""
     spec = active_t212_instruments.get(t212_ticker, {})
     
     qty_precision = spec.get('quantityPrecision', 0)
     min_qty = spec.get('minTradeQuantity', 1.0)
     price_precision = spec.get('minTradePricePrecision', 2)
 
-    # Calculate quantity with exact precision
     qty = max(float(min_qty), float(raw_shares))
     if qty_precision == 0:
         formatted_qty = int(round(qty))
     else:
         formatted_qty = float(round(qty, qty_precision))
 
-    # Format price with instrument's precision
     formatted_price = float(round(raw_price, price_precision))
-
     return formatted_qty, formatted_price
 
 def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
     url = f"{T212_BASE_URL}/equity/orders/limit"
     t212_ticker = resolve_t212_ticker(ticker)
 
-    # Pas dynamische specificaties per aandeel toe
     quantity, limit_price = format_quantity_and_price(t212_ticker, shares, entry_price)
 
-    payload = {
+    # Payload optie 1: Standaard DAY order
+    payload_day = {
         "ticker": t212_ticker,
         "quantity": quantity,
         "limitPrice": limit_price,
         "timeInForce": "DAY"
     }
 
+    # Debug print naar console/logs
+    print(f"[DEBUG ORDER PAYLOAD]: {json.dumps(payload_day)}")
+
     try:
         res = requests.post(
             url, 
-            json=payload, 
+            json=payload_day, 
             headers=T212_HEADERS, 
             auth=T212_AUTH, 
             timeout=10
         )
+        
+        # Als DAY faalt met 400, probeer GOOD_TILL_CANCEL als automatische fallback
+        if res.status_code == 400:
+            print(f"⚠️ DAY order afgekeurd voor {t212_ticker}. Proberen met GOOD_TILL_CANCEL...")
+            payload_gtc = {
+                "ticker": t212_ticker,
+                "quantity": quantity,
+                "limitPrice": limit_price,
+                "timeInForce": "GOOD_TILL_CANCEL"
+            }
+            res = requests.post(
+                url, 
+                json=payload_gtc, 
+                headers=T212_HEADERS, 
+                auth=T212_AUTH, 
+                timeout=10
+            )
+
         if res.status_code in [200, 202]:
             order_data = res.json()
             msg = (
@@ -203,7 +220,6 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
                 f"🎯 *Entry (5m OB Top):* ${limit_price}\n"
                 f"🛑 *Stop Loss:* ${stop_loss}\n"
                 f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
-                f"⏳ *Geldigheid:* `DAY`\n"
                 f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
             )
             notify_telegram(msg)
@@ -213,7 +229,8 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
                 f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
                 f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
                 f"📊 *Status Code:* `{res.status_code}`\n"
-                f"❌ *Reden van T212:* `{res.text}`"
+                f"❌ *Reden van T212:* `{res.text}`\n"
+                f"📄 *Verstuurde Payload:* `{json.dumps(payload_day)}`"
             )
             notify_telegram(error_msg)
             return False
