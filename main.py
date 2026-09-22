@@ -107,6 +107,8 @@ def fetch_active_positions():
         res = requests.get(url, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
         if res.status_code == 200:
             return {item['ticker']: item for item in res.json()}
+        elif res.status_code == 429:
+            time.sleep(2)
     except Exception as e:
         print(f"Fout bij ophalen portfolio: {e}")
     return {}
@@ -174,69 +176,63 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
 
     quantity, limit_price = format_quantity_and_price(t212_ticker, shares, entry_price)
 
-    # Payload optie 1: Standaard DAY order
-    payload_day = {
+    payload = {
         "ticker": t212_ticker,
         "quantity": quantity,
         "limitPrice": limit_price,
         "timeInForce": "DAY"
     }
 
-    # Debug print naar console/logs
-    print(f"[DEBUG ORDER PAYLOAD]: {json.dumps(payload_day)}")
-
-    try:
-        res = requests.post(
-            url, 
-            json=payload_day, 
-            headers=T212_HEADERS, 
-            auth=T212_AUTH, 
-            timeout=10
-        )
-        
-        # Als DAY faalt met 400, probeer GOOD_TILL_CANCEL als automatische fallback
-        if res.status_code == 400:
-            print(f"⚠️ DAY order afgekeurd voor {t212_ticker}. Proberen met GOOD_TILL_CANCEL...")
-            payload_gtc = {
-                "ticker": t212_ticker,
-                "quantity": quantity,
-                "limitPrice": limit_price,
-                "timeInForce": "GOOD_TILL_CANCEL"
-            }
+    # Probeer order te plaatsen met automatische retry bij 429 Rate Limits
+    for attempt in range(3):
+        try:
             res = requests.post(
                 url, 
-                json=payload_gtc, 
+                json=payload, 
                 headers=T212_HEADERS, 
                 auth=T212_AUTH, 
                 timeout=10
             )
+            
+            if res.status_code in [200, 202]:
+                order_data = res.json()
+                msg = (
+                    f"🟢 *AUTONOMOUS 5M ORDER GEPLAATST*\n\n"
+                    f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
+                    f"📦 *Aantal:* {quantity} stuks\n"
+                    f"🎯 *Entry (5m OB Top):* ${limit_price}\n"
+                    f"🛑 *Stop Loss:* ${stop_loss}\n"
+                    f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
+                    f"⏳ *Geldigheid:* `DAY`\n"
+                    f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
+                )
+                notify_telegram(msg)
+                time.sleep(1.0) # Rustpauze om Rate Limits te voorkomen
+                return True
+                
+            elif res.status_code == 429:
+                print(f"⏳ Rate limit bereikt bij T212 (429). Wachten {2 * (attempt + 1)} seconden...")
+                time.sleep(2 * (attempt + 1))
+                continue
+                
+            else:
+                error_msg = (
+                    f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
+                    f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
+                    f"📊 *Status Code:* `{res.status_code}`\n"
+                    f"❌ *Reden van T212:* `{res.text}`\n"
+                    f"📄 *Verstuurde Payload:* `{json.dumps(payload)}`"
+                )
+                notify_telegram(error_msg)
+                return False
 
-        if res.status_code in [200, 202]:
-            order_data = res.json()
-            msg = (
-                f"🟢 *AUTONOMOUS 5M ORDER GEPLAATST*\n\n"
-                f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
-                f"📦 *Aantal:* {quantity} stuks\n"
-                f"🎯 *Entry (5m OB Top):* ${limit_price}\n"
-                f"🛑 *Stop Loss:* ${stop_loss}\n"
-                f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
-                f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
-            )
-            notify_telegram(msg)
-            return True
-        else:
-            error_msg = (
-                f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
-                f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
-                f"📊 *Status Code:* `{res.status_code}`\n"
-                f"❌ *Reden van T212:* `{res.text}`\n"
-                f"📄 *Verstuurde Payload:* `{json.dumps(payload_day)}`"
-            )
-            notify_telegram(error_msg)
-            return False
-    except Exception as e:
-        notify_telegram(f"🚨 *CRITISCHE ORDER FOUT (NETWERK/API)*\n\n📌 *Asset:* `{t212_ticker}`\n❌ *Foutmelding:* `{e}`")
-        return False
+        except Exception as e:
+            if attempt == 2:
+                notify_telegram(f"🚨 *CRITISCHE ORDER FOUT (NETWERK/API)*\n\n📌 *Asset:* `{t212_ticker}`\n❌ *Foutmelding:* `{e}`")
+                return False
+            time.sleep(2)
+            
+    return False
 
 # ==========================================
 # 4. TARGETED MULTI-TIMEFRAME SCANNER (1H + 15M + 5M)
@@ -404,6 +400,7 @@ def main():
                         )
                         if success:
                             executed_setups.add(setup_id)
+                        time.sleep(1.0)  # Pomp pauze tussen meerdere orders in 1 scanronde
             else:
                 print("⏳ Buiten NY Sessie venster (13:30-21:00 NL). Geen nieuwe scans uitgevoerd.")
 
