@@ -29,7 +29,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # T212 Base URL (Standaard ingesteld op DEMO)
 T212_BASE_URL = os.getenv("T212_BASE_URL", "https://demo.trading212.com/api/v0")
 
-# Dual-Auth Setup (Werkt voor zowel Authorization Header als Basic HTTP Auth)
+# Dual Auth Setup voor T212 API v0
 T212_HEADERS = {
     "Content-Type": "application/json",
     "Authorization": T212_API_KEY_ID
@@ -40,8 +40,18 @@ ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", 10000.0))
 RISK_PER_TRADE_PCT = 0.01
 SCAN_INTERVAL_MINUTES = 3
 
-FUTURES_MAP = {"GC=F": "GLD", "SI=F": "SLV", "ZW=F": "WEAT"}
+# Mapping tabel voor yfinance ticker naar Trading 212 symbool
+T212_SYMBOL_MAP = {
+    "VUSA": "VUSA_EQ",
+    "EQAC": "EQAC_EQ",
+    "IUSN": "IUSN_EQ",
+    "SMH": "SMH_EQ",
+    "SGLN": "SGLN_EQ",
+    "SSLV": "SSLV_EQ"
+}
+
 daily_report_sent = False
+active_t212_instruments = set()
 
 # ==========================================
 # 2. TELEGRAM ENGINE & REPORTING
@@ -74,7 +84,7 @@ def send_daily_portfolio_report():
         current_price = pos.get('currentPrice', 0.0)
         total_pnl += ppl
         status_emoji = "🟢" if ppl >= 0 else "🔴"
-        clean_ticker = ticker.replace("_US_EQ", "")
+        clean_ticker = ticker.replace("_US_EQ", "").replace("_EQ", "")
         lines.append(f"{status_emoji} *{clean_ticker}*: `${ppl:+.2f}` ({quantity} stuks @ ${current_price})")
 
     overall_emoji = "📈" if total_pnl >= 0 else "📉"
@@ -100,20 +110,30 @@ def fetch_active_positions():
         print(f"Fout bij ophalen portfolio: {e}")
     return {}
 
+def resolve_t212_ticker(ticker):
+    """Bepaalt de exacte T212 ticker-notatie op basis van de geladen metadata."""
+    if ticker in T212_SYMBOL_MAP:
+        return T212_SYMBOL_MAP[ticker]
+    
+    candidates = [f"{ticker}_US_EQ", f"{ticker}_EQ", ticker]
+    for cand in candidates:
+        if cand in active_t212_instruments:
+            return cand
+    return f"{ticker}_US_EQ"
+
 def validate_market_universe_with_t212(raw_tickers):
+    global active_t212_instruments
     url = f"{T212_BASE_URL}/equity/metadata/instruments"
     try:
         res = requests.get(url, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
         if res.status_code == 200:
-            t212_instruments = {item['ticker'] for item in res.json()}
+            active_t212_instruments = {item['ticker'] for item in res.json()}
             valid_tickers = []
             invalid_tickers = []
 
             for ticker in raw_tickers:
-                exec_ticker = FUTURES_MAP.get(ticker, ticker)
-                t212_symbol = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
-                
-                if t212_symbol in t212_instruments:
+                resolved = resolve_t212_ticker(ticker)
+                if resolved in active_t212_instruments:
                     valid_tickers.append(ticker)
                 else:
                     invalid_tickers.append(ticker)
@@ -131,19 +151,18 @@ def validate_market_universe_with_t212(raw_tickers):
 
 def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
     url = f"{T212_BASE_URL}/equity/orders/limit"
-    exec_ticker = FUTURES_MAP.get(ticker, ticker)
-    t212_ticker = f"{exec_ticker}_US_EQ" if "_" not in exec_ticker else exec_ticker
+    t212_ticker = resolve_t212_ticker(ticker)
 
-    # Zorg dat quantity minimaal 1.0 is of een afgeronde float
+    # Zorg voor correcte types & afronding
     quantity = float(round(max(1.0, float(shares)), 2))
     limit_price = float(round(entry_price, 2))
 
-    # T212 API v0 geaccepteerde payload voor Limit Orders
+    # Geldige T212 Payload met "DAY" als timeInForce
     payload = {
         "ticker": t212_ticker,
         "quantity": quantity,
         "limitPrice": limit_price,
-        "timeInForce": "GOOD_TILL_CANCEL"
+        "timeInForce": "DAY"
     }
 
     try:
@@ -158,12 +177,12 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
             order_data = res.json()
             msg = (
                 f"🟢 *AUTONOMOUS 5M ORDER GEPLAATST*\n\n"
-                f"📌 *Asset:* `{exec_ticker}` ({ticker})\n"
+                f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
                 f"📦 *Aantal:* {quantity} stuks\n"
                 f"🎯 *Entry (5m OB Top):* ${limit_price}\n"
                 f"🛑 *Stop Loss:* ${stop_loss}\n"
                 f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
-                f"⏳ *Geldigheid:* `GOOD_TILL_CANCEL`\n"
+                f"⏳ *Geldigheid:* `DAY` (Dagorder)\n"
                 f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
             )
             notify_telegram(msg)
@@ -171,14 +190,14 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
         else:
             error_msg = (
                 f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
-                f"📌 *Asset:* `{exec_ticker}` ({ticker})\n"
+                f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
                 f"📊 *Status Code:* `{res.status_code}`\n"
                 f"❌ *Reden van T212:* `{res.text}`"
             )
             notify_telegram(error_msg)
             return False
     except Exception as e:
-        notify_telegram(f"🚨 *CRITISCHE ORDER FOUT (NETWERK/API)*\n\n📌 *Asset:* `{exec_ticker}`\n❌ *Foutmelding:* `{e}`")
+        notify_telegram(f"🚨 *CRITISCHE ORDER FOUT (NETWERK/API)*\n\n📌 *Asset:* `{t212_ticker}`\n❌ *Foutmelding:* `{e}`")
         return False
 
 # ==========================================
@@ -197,15 +216,22 @@ def is_ny_session():
 
 def get_raw_market_universe():
     return [
-        # Major Tech & Growth
+        # Major Tech & Growth (US Stocks)
         "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX",
         "PLTR", "COIN", "TSM", "SMCI", "ARM", "PANW", "CRWD", "UBER", "ABNB",
-        # Finance & Industrials
+        
+        # Finance & Industrials (US Stocks)
         "JPM", "BAC", "GS", "MS", "V", "MA", "CAT", "DIS",
-        # Indices & Sector ETFs
-        "SPY", "QQQ", "IWM", "SMH",
-        # Commodities (Futures -> T212 Mapped)
-        "GC=F", "SI=F", "HG=F", "ZW=F", "CL=F"
+        
+        # European UCITS ETFs op Trading 212 (Werkend op T212 Invest API)
+        "VUSA",  # Vanguard S&P 500 UCITS ETF
+        "EQAC",  # Invesco EQQQ Nasdaq-100 UCITS ETF
+        "IUSN",  # iShares MSCI World Small Cap UCITS ETF
+        "SMH",   # VanEck Semiconductor UCITS ETF
+        
+        # Physical Commodity ETFs op T212
+        "SGLN",  # iShares Physical Gold ETC
+        "SSLV"   # iShares Physical Silver ETC
     ]
 
 def scan_single_ticker(ticker):
@@ -291,7 +317,7 @@ def run_isolated_scan(active_universe):
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1H + 15m Alignment -> 5m OB/FVG Precision (35+ Tickers).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1H + 15m Alignment -> 5m OB/FVG Precision (30+ Tickers).")
     
     raw_universe = get_raw_market_universe()
     active_universe = validate_market_universe_with_t212(raw_universe)
