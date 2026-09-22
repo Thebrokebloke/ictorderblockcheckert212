@@ -51,7 +51,7 @@ T212_SYMBOL_MAP = {
 }
 
 daily_report_sent = False
-active_t212_instruments = set()
+active_t212_instruments = {}
 
 # ==========================================
 # 2. TELEGRAM ENGINE & REPORTING
@@ -98,7 +98,7 @@ def send_daily_portfolio_report():
     notify_telegram(report_msg)
 
 # ==========================================
-# 3. TRADING 212 EXECUTIE & METADATA CHECK
+# 3. TRADING 212 EXECUTIE & DYNAMISCHE METADATA
 # ==========================================
 def fetch_active_positions():
     url = f"{T212_BASE_URL}/equity/portfolio"
@@ -127,7 +127,10 @@ def validate_market_universe_with_t212(raw_tickers):
     try:
         res = requests.get(url, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
         if res.status_code == 200:
-            active_t212_instruments = {item['ticker'] for item in res.json()}
+            # Sla de volledige specificaties per instrument op
+            instruments_data = res.json()
+            active_t212_instruments = {item['ticker']: item for item in instruments_data}
+            
             valid_tickers = []
             invalid_tickers = []
 
@@ -149,15 +152,33 @@ def validate_market_universe_with_t212(raw_tickers):
         notify_telegram(f"⚠️ T212 Metadata check kon niet worden geladen: `{e}`. Standaard universe wordt gebruikt.")
     return raw_tickers
 
+def format_quantity_and_price(t212_ticker, raw_shares, raw_price):
+    """Formatteert quantity en limitPrice exact naar de specificaties van T212 voor het aandeel."""
+    spec = active_t212_instruments.get(t212_ticker, {})
+    
+    qty_precision = spec.get('quantityPrecision', 0)
+    min_qty = spec.get('minTradeQuantity', 1.0)
+    price_precision = spec.get('minTradePricePrecision', 2)
+
+    # Calculate quantity with exact precision
+    qty = max(float(min_qty), float(raw_shares))
+    if qty_precision == 0:
+        formatted_qty = int(round(qty))
+    else:
+        formatted_qty = float(round(qty, qty_precision))
+
+    # Format price with instrument's precision
+    formatted_price = float(round(raw_price, price_precision))
+
+    return formatted_qty, formatted_price
+
 def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
     url = f"{T212_BASE_URL}/equity/orders/limit"
     t212_ticker = resolve_t212_ticker(ticker)
 
-    # Zorg dat de hoeveelheid een integer is voor US EQ aandelen
-    quantity = int(max(1, round(float(shares))))
-    limit_price = float(round(entry_price, 2))
+    # Pas dynamische specificaties per aandeel toe
+    quantity, limit_price = format_quantity_and_price(t212_ticker, shares, entry_price)
 
-    # Officiele T212 Public API Limit Order Schema
     payload = {
         "ticker": t212_ticker,
         "quantity": quantity,
