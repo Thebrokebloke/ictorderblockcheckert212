@@ -153,11 +153,10 @@ def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_pro
     url = f"{T212_BASE_URL}/equity/orders/limit"
     t212_ticker = resolve_t212_ticker(ticker)
 
-    # Zorg voor correcte types & afronding
-    quantity = float(round(max(1.0, float(shares)), 2))
+    # Zorg dat quantity een heel getal is (minimaal 1) ter voorkoming van T212 payload errors bij fracties
+    quantity = int(max(1, round(float(shares))))
     limit_price = float(round(entry_price, 2))
 
-    # Geldige T212 Payload met "DAY" als timeInForce
     payload = {
         "ticker": t212_ticker,
         "quantity": quantity,
