@@ -21,16 +21,15 @@ yf.set_tz_cache_location("/tmp/yf_cache")
 NY_TZ = pytz.timezone('America/New_York')
 NL_TZ = pytz.timezone('Europe/Amsterdam')
 
-# Flexibele uitlezing van omgevingsvariabelen
+# Omgevingsvariabelen
 T212_API_KEY_ID = os.getenv("T212_API_KEY_ID") or os.getenv("T212_API_KEY", "")
 T212_SECRET_KEY = os.getenv("T212_SECRET_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# T212 Base URL (Standaard ingesteld op DEMO)
+# T212 Base URL (Standaard op DEMO)
 T212_BASE_URL = os.getenv("T212_BASE_URL", "https://demo.trading212.com/api/v0")
 
-# Dual Auth Setup voor T212 API v0
 T212_HEADERS = {
     "Content-Type": "application/json",
     "Authorization": T212_API_KEY_ID
@@ -39,7 +38,8 @@ T212_AUTH = HTTPBasicAuth(T212_API_KEY_ID, T212_SECRET_KEY) if T212_SECRET_KEY e
 
 ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", 5000.0))
 RISK_PER_TRADE_PCT = 0.01  # 1% risico = $50 per trade
-MAX_POSITION_VALUE = ACCOUNT_CAPITAL * 0.20  # Max 20% ($1000) orderwaarde per positie
+MAX_POSITION_VALUE = ACCOUNT_CAPITAL * 0.20  # Max 20% ($1000) per order
+MAX_SLIPPAGE_PCT = 0.003  # Max 0.3% slippage toegestaan op market fills
 SCAN_INTERVAL_MINUTES = 3
 
 # Mapping tabel voor yfinance ticker naar Trading 212 symbool
@@ -54,6 +54,7 @@ T212_SYMBOL_MAP = {
 
 daily_report_sent = False
 active_t212_instruments = {}
+active_managed_trades = {}  # In-memory tracking voor virtuele SL/TP bewaking
 
 # ==========================================
 # 2. TELEGRAM ENGINE & REPORTING
@@ -100,7 +101,7 @@ def send_daily_portfolio_report():
     notify_telegram(report_msg)
 
 # ==========================================
-# 3. TRADING 212 EXECUTIE & DYNAMISCHE METADATA
+# 3. TRADING 212 EXECUTIE & SLIPPAGE GUARD
 # ==========================================
 def fetch_active_positions():
     url = f"{T212_BASE_URL}/equity/portfolio"
@@ -115,10 +116,8 @@ def fetch_active_positions():
     return {}
 
 def resolve_t212_ticker(ticker):
-    """Bepaalt de exacte T212 ticker-notatie op basis van de geladen metadata."""
     if ticker in T212_SYMBOL_MAP:
         return T212_SYMBOL_MAP[ticker]
-    
     candidates = [f"{ticker}_US_EQ", f"{ticker}_EQ", ticker]
     for cand in candidates:
         if cand in active_t212_instruments:
@@ -136,7 +135,6 @@ def validate_market_universe_with_t212(raw_tickers):
             
             valid_tickers = []
             invalid_tickers = []
-
             for ticker in raw_tickers:
                 resolved = resolve_t212_ticker(ticker)
                 if resolved in active_t212_instruments:
@@ -147,106 +145,168 @@ def validate_market_universe_with_t212(raw_tickers):
             if invalid_tickers:
                 notify_telegram(
                     f"⚠️ *T212 METADATA CHECK*\n"
-                    f"De volgende tickers zijn NIET gevonden op T212 en worden overgeslagen:\n"
-                    f"`{', '.join(invalid_tickers)}`"
+                    f"Volgende tickers niet gevonden op T212 en overgeslagen:\n`{', '.join(invalid_tickers)}`"
                 )
             return valid_tickers
     except Exception as e:
-        notify_telegram(f"⚠️ T212 Metadata check kon niet worden geladen: `{e}`. Standaard universe wordt gebruikt.")
+        notify_telegram(f"⚠️ Metadata check mislukt: `{e}`.")
     return raw_tickers
 
-def format_quantity_and_price(t212_ticker, raw_shares, raw_price):
-    spec = active_t212_instruments.get(t212_ticker, {})
-    
-    qty_precision = spec.get('quantityPrecision', 0)
-    min_qty = spec.get('minTradeQuantity', 1.0)
-    price_precision = spec.get('minTradePricePrecision', 2)
-
-    # 1. Cap de maximale positiewaarde tot 20% van kapitaal ($1000 max per order)
-    total_order_val = float(raw_shares) * float(raw_price)
-    if total_order_val > MAX_POSITION_VALUE:
-        capped_shares = MAX_POSITION_VALUE / float(raw_price)
-        raw_shares = capped_shares
-
-    # 2. Garandeer minimale orderwaarde voor T212 (minimaal $15 USD per order)
-    if float(raw_shares) * float(raw_price) < 15.0:
-        raw_shares = 15.0 / float(raw_price)
-
-    # 3. Formatteer hoeveelheid (US Aandelen altijd als integer)
-    qty = max(float(min_qty), float(raw_shares))
-    if qty_precision == 0 or "_US_EQ" in t212_ticker:
-        formatted_qty = int(round(qty))
-        if formatted_qty < 1:
-            formatted_qty = 1
-    else:
-        formatted_qty = float(round(qty, qty_precision))
-
-    formatted_price = float(round(raw_price, price_precision))
-    return formatted_qty, formatted_price
-
-def place_t212_order_with_sl_tp(ticker, shares, entry_price, stop_loss, take_profit):
-    url = f"{T212_BASE_URL}/equity/orders/limit"
-    t212_ticker = resolve_t212_ticker(ticker)
-
-    quantity, limit_price = format_quantity_and_price(t212_ticker, shares, entry_price)
-
-    # T212 v0 API accepteert 'GOOD_TILL_CANCEL' of 'DAY' als enum
+def close_t212_position(t212_ticker, quantity):
+    """Sluit een positie via een Market Sell order."""
+    url = f"{T212_BASE_URL}/equity/orders/market"
     payload = {
         "ticker": t212_ticker,
-        "quantity": int(quantity) if isinstance(quantity, (int, float)) and float(quantity).is_integer() else quantity,
-        "limitPrice": float(limit_price),
-        "timeInForce": "GOOD_TILL_CANCEL"
+        "quantity": -abs(float(quantity))
+    }
+    try:
+        res = requests.post(url, json=payload, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
+        return res.status_code in [200, 202]
+    except Exception as e:
+        print(f"Fout bij sluiten positie {t212_ticker}: {e}")
+        return False
+
+def place_t212_market_order_with_rr_guard(ticker, shares, target_entry_price, ob_bottom):
+    """
+    Plaatst een Market Order, valideert de daadwerkelijke Fill Price (Slippage Guard),
+    en berekent de exacte SL en 1:3 TP op basis van de uiteindelijke uitvoering.
+    """
+    url = f"{T212_BASE_URL}/equity/orders/market"
+    t212_ticker = resolve_t212_ticker(ticker)
+
+    spec = active_t212_instruments.get(t212_ticker, {})
+    qty_precision = spec.get('quantityPrecision', 0)
+    min_qty = spec.get('minTradeQuantity', 1.0)
+
+    # Capital Risk Limit: Max $1000 totale orderwaarde
+    total_order_val = float(shares) * float(target_entry_price)
+    if total_order_val > MAX_POSITION_VALUE:
+        shares = MAX_POSITION_VALUE / float(target_entry_price)
+
+    qty = max(float(min_qty), float(shares))
+    if qty_precision == 0 or "_US_EQ" in t212_ticker:
+        quantity = int(round(qty))
+        if quantity < 1: quantity = 1
+    else:
+        quantity = round(qty, qty_precision)
+
+    payload = {
+        "ticker": t212_ticker,
+        "quantity": quantity
     }
 
-    for attempt in range(3):
-        try:
-            res = requests.post(
-                url, 
-                json=payload, 
-                headers=T212_HEADERS, 
-                auth=T212_AUTH, 
-                timeout=10
-            )
+    try:
+        res = requests.post(url, json=payload, headers=T212_HEADERS, auth=T212_AUTH, timeout=10)
+        
+        if res.status_code in [200, 202]:
+            time.sleep(1.5)  # Korte pauze tot order gevuld is in portfolio
             
-            if res.status_code in [200, 202]:
-                order_data = res.json()
-                msg = (
-                    f"🟢 *AUTONOMOUS 5M ORDER GEPLAATST*\n\n"
+            # 1. Haal de actieve positie op voor de ECHTE Fill Price
+            positions = fetch_active_positions()
+            pos_info = positions.get(t212_ticker)
+
+            actual_fill_price = float(pos_info.get('averagePrice', target_entry_price)) if pos_info else target_entry_price
+
+            # 2. FILL PRICE BEWAKING (Slippage Guard)
+            slippage_pct = abs(actual_fill_price - target_entry_price) / target_entry_price
+            if slippage_pct > MAX_SLIPPAGE_PCT:
+                notify_telegram(
+                    f"🚨 *SLIPPAGE GUARD GEACTIVEERD*\n\n"
                     f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
-                    f"📦 *Aantal:* {quantity} stuks\n"
-                    f"🎯 *Entry (5m OB Top):* ${limit_price}\n"
-                    f"🛑 *Stop Loss:* ${stop_loss}\n"
-                    f"🏆 *Take Profit (1:3 RR):* ${take_profit}\n"
-                    f"⏳ *Geldigheid:* `GOOD_TILL_CANCEL`\n"
-                    f"🆔 *Order ID:* `{order_data.get('id', 'N/A')}`"
+                    f"🎯 *Beoogde Entry:* ${target_entry_price:.2f}\n"
+                    f"⚠️ *Werkelijke Fill Price:* ${actual_fill_price:.2f} ({slippage_pct*100:.2f}% slippage)\n"
+                    f"🛑 *Actie:* Positie wordt direct gesloten."
                 )
-                notify_telegram(msg)
-                time.sleep(1.0)
-                return True
-                
-            elif res.status_code == 429:
-                print(f"⏳ Rate limit bereikt bij T212 (429). Wachten {2 * (attempt + 1)} seconden...")
-                time.sleep(2 * (attempt + 1))
-                continue
-                
-            else:
-                error_msg = (
-                    f"⚠️ *ORDER WEIGERD DOOR TRADING 212*\n\n"
-                    f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
-                    f"📊 *Status Code:* `{res.status_code}`\n"
-                    f"❌ *Reden van T212:* `{res.text}`\n"
-                    f"📄 *Verstuurde Payload:* `{json.dumps(payload)}`"
-                )
-                notify_telegram(error_msg)
+                close_t212_position(t212_ticker, quantity)
                 return False
 
-        except Exception as e:
-            if attempt == 2:
-                notify_telegram(f"🚨 *CRITISCHE ORDER FOUT*\n\n📌 *Asset:* `{t212_ticker}`\n❌ *Foutmelding:* `{e}`")
+            # 3. DYNAMISCHE SL & TP HERBEREKENING (1:3 RR)
+            actual_risk = actual_fill_price - ob_bottom
+            if actual_risk <= 0:
+                close_t212_position(t212_ticker, quantity)
                 return False
-            time.sleep(2)
-            
-    return False
+
+            exact_stop_loss = round(ob_bottom, 2)
+            exact_take_profit = round(actual_fill_price + (actual_risk * 3), 2)
+
+            # Sla op in intern geheugen voor virtuele bewaking
+            active_managed_trades[t212_ticker] = {
+                "quantity": quantity,
+                "fill_price": actual_fill_price,
+                "stop_loss": exact_stop_loss,
+                "take_profit": exact_take_profit
+            }
+
+            msg = (
+                f"🟢 *AUTONOMOUS MARKET ORDER GEVULD*\n\n"
+                f"📌 *Asset:* `{t212_ticker}` ({ticker})\n"
+                f"📦 *Aantal:* {quantity} stuks\n"
+                f"💵 *Gevulde Prijs (Fill Price):* ${actual_fill_price:.2f}\n"
+                f"🛑 *Gevalideerde Stop Loss:* ${exact_stop_loss:.2f}\n"
+                f"🏆 *Gevalideerde Take Profit (1:3 RR):* ${exact_take_profit:.2f}\n"
+                f"📊 *Risico per aandeel:* ${actual_risk:.2f}"
+            )
+            notify_telegram(msg)
+            return True
+
+        else:
+            notify_telegram(
+                f"⚠️ *MARKET ORDER WEIGERD DOOR T212*\n\n"
+                f"📌 *Asset:* `{t212_ticker}`\n"
+                f"📊 *Status:* `{res.status_code}`\n"
+                f"❌ *Reden:* `{res.text}`"
+            )
+            return False
+
+    except Exception as e:
+        notify_telegram(f"🚨 *CRITISCHE EXECUTIE FOUT:* `{e}`")
+        return False
+
+def monitor_active_trades():
+    """Bewaakt actieve posities en sluit ze autonoom als SL of TP geraakt wordt."""
+    if not active_managed_trades:
+        return
+
+    positions = fetch_active_positions()
+    for t212_ticker, trade_info in list(active_managed_trades.items()):
+        pos = positions.get(t212_ticker)
+        if not pos:
+            # Positie is handmatig of extern gesloten
+            del active_managed_trades[t212_ticker]
+            continue
+
+        current_price = float(pos.get('currentPrice', 0.0))
+        if current_price <= 0: continue
+
+        sl = trade_info['stop_loss']
+        tp = trade_info['take_profit']
+        qty = trade_info['quantity']
+
+        # Check Stop Loss
+        if current_price <= sl:
+            if close_t212_position(t212_ticker, qty):
+                pnl = (current_price - trade_info['fill_price']) * qty
+                notify_telegram(
+                    f"🔴 *STOP LOSS GERAAKT*\n\n"
+                    f"📌 *Asset:* `{t212_ticker}`\n"
+                    f"🛑 *SL Niveau:* ${sl:.2f}\n"
+                    f"💵 *Sluitingsprijs:* ${current_price:.2f}\n"
+                    f"📉 *Gerealiseerd PnL:* `${pnl:+.2f}`"
+                )
+                del active_managed_trades[t212_ticker]
+
+        # Check Take Profit
+        elif current_price >= tp:
+            if close_t212_position(t212_ticker, qty):
+                pnl = (current_price - trade_info['fill_price']) * qty
+                notify_telegram(
+                    f"🟢 *TAKE PROFIT GERAAKT (1:3 RR)*\n\n"
+                    f"📌 *Asset:* `{t212_ticker}`\n"
+                    f"🏆 *TP Niveau:* ${tp:.2f}\n"
+                    f"💵 *Sluitingsprijs:* ${current_price:.2f}\n"
+                    f"📈 *Gerealiseerd PnL:* `${pnl:+.2f}`"
+                )
+                del active_managed_trades[t212_ticker]
 
 # ==========================================
 # 4. TARGETED MULTI-TIMEFRAME SCANNER (1H + 15M + 5M)
@@ -256,7 +316,6 @@ def is_bullish(df):
     return df['Low'].iloc[-1] > df['Low'].iloc[-3] and df['High'].iloc[-1] > df['High'].iloc[-3]
 
 def is_ny_session():
-    """Controleert of we in de NY beurssessie zitten (13:30 - 21:00 NL tijd)."""
     now_nl = datetime.datetime.now(NL_TZ)
     start_time = now_nl.replace(hour=13, minute=30, second=0, microsecond=0)
     end_time = now_nl.replace(hour=21, minute=0, second=0, microsecond=0)
@@ -264,14 +323,9 @@ def is_ny_session():
 
 def get_raw_market_universe():
     return [
-        # Major Tech & Growth (US Stocks)
         "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX",
         "PLTR", "COIN", "TSM", "SMCI", "ARM", "PANW", "CRWD", "UBER", "ABNB",
-        
-        # Finance & Industrials (US Stocks)
         "JPM", "BAC", "GS", "MS", "V", "MA", "CAT", "DIS",
-        
-        # European UCITS ETFs op Trading 212
         "VUSA", "EQAC", "IUSN", "SMH", "SGLN", "SSLV"
     ]
 
@@ -284,18 +338,17 @@ def clean_dataframe(df):
 
 def scan_single_ticker(ticker):
     try:
-        # Gebruik auto_adjust=True voor split-gecorrigeerde prijzen
-        df_1h = yf.download(ticker, period="7d", interval="1h", progress=False, auto_adjust=True)
+        df_1h = yf.download(ticker, period="7d", interval="1h", progress=False, auto_adjust=True, repair=True)
         df_1h = clean_dataframe(df_1h)
         if df_1h is None or not is_bullish(df_1h): 
             return None
 
-        df_15m = yf.download(ticker, period="3d", interval="15m", progress=False, auto_adjust=True)
+        df_15m = yf.download(ticker, period="3d", interval="15m", progress=False, auto_adjust=True, repair=True)
         df_15m = clean_dataframe(df_15m)
         if df_15m is None or not is_bullish(df_15m): 
             return None
 
-        df_5m = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True)
+        df_5m = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True, repair=True)
         df_5m = clean_dataframe(df_5m)
         if df_5m is None or len(df_5m) < 10: 
             return None
@@ -314,15 +367,13 @@ def scan_single_ticker(ticker):
                 ob_top = round(float(c_ob['High']), 2)
                 ob_bottom = round(float(c_ob['Low']), 2)
 
-                # STRIKTE REALTIME SANITY CHECK: Negeer orders die > 2% afwijken van actuele koers
-                if abs(ob_top - current_realtime_price) / current_realtime_price > 0.02:
-                    print(f"⚠️ {ticker} overgeslagen: berekende entry ${ob_top} wekt >2\% af van actuele prijs${current_realtime_price:.2f}")
+                # SANITY CHECK: Negeer setups waar de prijs al te ver doorgelopen is (>1.5% van OB)
+                if abs(ob_top - current_realtime_price) / current_realtime_price > 0.015:
                     continue
 
                 risk_per_share = ob_top - ob_bottom
                 if risk_per_share <= 0: continue
 
-                take_profit = round(ob_top + (risk_per_share * 3), 2)
                 shares = round((ACCOUNT_CAPITAL * RISK_PER_TRADE_PCT) / risk_per_share, 2)
 
                 if shares > 0:
@@ -330,7 +381,6 @@ def scan_single_ticker(ticker):
                         "ticker": ticker,
                         "ob_top": ob_top,
                         "ob_bottom": ob_bottom,
-                        "take_profit": take_profit,
                         "shares": shares
                     }
         return None
@@ -367,14 +417,13 @@ def run_isolated_scan(active_universe):
 # ==========================================
 def main():
     global daily_report_sent
-    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: 1H + 15m Alignment -> 5m OB/FVG Precision ($5000 Account).")
+    notify_telegram("🤖 *ICT CLOUD AGENT ONLINE*\nStrategie: Market Execution + Dynamic Slippage & 1:3 RR Guard ($5000 Account).")
     
     raw_universe = get_raw_market_universe()
     active_universe = validate_market_universe_with_t212(raw_universe)
     notify_telegram(f"✅ *T212 UNIVERSE GEVALIDEERD:* `{len(active_universe)}/{len(raw_universe)}` Tickers Actief.")
 
     executed_setups = set()
-    tracked_positions = {}
     loop_count = 0
 
     while True:
@@ -389,30 +438,21 @@ def main():
             else:
                 daily_report_sent = False
 
-            current_positions = fetch_active_positions()
-            for prev_ticker in list(tracked_positions.keys()):
-                if prev_ticker not in current_positions:
-                    notify_telegram(
-                        f"🔴 *POSITIE GESLOTEN (SL / TP HIT)*\n\n"
-                        f"📌 *Asset:* `{prev_ticker}`\n"
-                        f"ℹ️ Positie is op Trading 212 gesloten."
-                    )
-                    del tracked_positions[prev_ticker]
-            tracked_positions = current_positions
+            # Bewaak actieve posities op virtuele SL/TP niveaus
+            monitor_active_trades()
 
             if is_ny_session():
                 found_setups = run_isolated_scan(active_universe)
-                print(f"Scan ronde {loop_count}: {len(found_setups)} geldige setup(s) gevonden uit {len(active_universe)} tickers.")
+                print(f"Scan ronde {loop_count}: {len(found_setups)} geldige setup(s) gevonden.")
                 
                 for setup in found_setups:
                     setup_id = f"{setup['ticker']}_{setup['ob_top']}"
                     if setup_id not in executed_setups:
-                        success = place_t212_order_with_sl_tp(
+                        success = place_t212_market_order_with_rr_guard(
                             ticker=setup['ticker'],
                             shares=setup['shares'],
-                            entry_price=setup['ob_top'],
-                            stop_loss=setup['ob_bottom'],
-                            take_profit=setup['take_profit']
+                            target_entry_price=setup['ob_top'],
+                            ob_bottom=setup['ob_bottom']
                         )
                         if success:
                             executed_setups.add(setup_id)
